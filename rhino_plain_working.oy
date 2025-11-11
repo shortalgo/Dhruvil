@@ -1,0 +1,3001 @@
+# -*- coding: utf-8 -*-
+"""
+Rhino + Calendar Strategy Implementation
+----------------------------------------
+
+This module implements the monthly Rhino (PUT-based) and Calendar (CALL-based) option strategy
+with automatic expiry rolling, VIX-regime-based adjustments, delta monitoring, and
+data-driven daily expiry alignment (no fixed 30-day assumption).
+
+Entry Logic:
+    • Enter on the first Monday of each month at 09:30.
+    • Up to 2 Rhinos and 1 Calendar allowed concurrently.
+
+Structures:
+    Rhino (PUT legs only)
+        leg1 = long put  (~0.50Δ)
+        leg2 = short put (~0.35 - 0.40Δ)
+        leg3 = long put  (~0.18Δ)
+        → 24 lots each long leg (leg1, leg3)
+        → 48 lots for short leg (leg2)
+
+    Calendar (CALL legs only)
+        Short call on same expiry (~0.40Δ)
+        Long call on next expiry (~0.40Δ)
+        → 32 lots each leg
+
+Lot size (per contract): 75
+
+Volatility Regime:
+    - VIX_Percentile_100D < 75 → Low-vol regime (additive behavior)
+    - VIX_Percentile_100D ≥ 75 → High-vol regime (defensive behavior)
+    - Rules checked per leg per Rhino and per Calendar.
+    - Any condition must persist for 3 consecutive 5-minute checks before acting.
+      If it breaks during the 15-minute window, reset its counter.
+
+Universal Exit:
+    - Exit all positions if any leg’s DTE < 15 days.
+
+Option Chain Scope:
+    - Evaluate only existing positions for delta checks.
+    - When adjustment required, rescan from ATM −10 strikes to +15 strikes
+      to find replacement legs (using freshly computed deltas).
+
+Expiry Roll Logic (DATA-DRIVEN DAILY ALIGNMENT):
+    option_data   → current-month expiry
+    option_data1  → next-month expiry
+    option_data2  → far-month expiry
+
+    Every trading day, for each open position:
+        1) Read mapped_days for that date to get MonthlyExpiry / Next Monthly Expiry / 3rd Monthly Expiry.
+        2) If position.expiry == mapped MonthlyExpiry  → quote from option_data
+           If position.expiry == mapped Next Monthly  → quote from option_data1
+           If position.expiry == mapped 3rd Monthly   → quote from option_data2
+        3) If none match (e.g., month rolled), SHIFT the file tier used for that position so it
+           references the correct dataset for its stored expiry. Positions remain intact; only data source shifts.
+
+    This guarantees continuous alignment without assuming any fixed ~30-day interval.
+
+Constants:
+    LOT_SIZE = 75
+    RHINO_LONG_LOTS = 24
+    RHINO_SHORT_LOTS = 48
+    CALENDAR_LOTS    = 32
+    RF_RATE          = 0.067
+    PERSIST_BARS     = 3   # 3 × 5-minute bars = 15 min
+    UNIVERSAL_EXIT_DTE = 15
+
+Inputs (DataFrames expected):
+    mapped_days: Date, MonthlyExpiry, Next Monthly Expiry, 3rd Monthly Expiry
+    vix_df:      Date, Open, High, Low, Close, VIX_Percentile_100D (daily)
+    index_df:    Date, Time, Spot (minute)
+    option_data:    monthly  (minute; has Date, Time, Type, StrikePrice, ExpiryDate, Open)
+    option_data1:   next     (minute; same columns)
+    option_data2:   far      (minute; same columns)
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+from datetime import datetime, time as dt_time, timedelta
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import brentq
+from scipy.stats import norm
+import os
+from helpers import pull_options_data_d, pull_index_data
+from functools import lru_cache
+from time import perf_counter
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional, Dict, List
+from collections import defaultdict
+
+from multiprocessing import Pool, cpu_count
+
+DELTA_POOL = None  # set in __main__; used inside pick_leg_by_delta
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=".*concatenation with empty or all-NA entries.*"
+)
+
+# --- Configuration & Constants ---
+stock = "NIFTY"
+roundoff = 50 if stock == 'NIFTY' else (100 if stock == 'SENSEX' else 50)
+LOT_SIZE = 75 if stock == 'NIFTY' else (20 if stock == 'SENSEX' else 40)
+brokerage = 4.5 if stock == 'NIFTY' else (3 if stock == 'SENSEX' else 3)
+
+root_path = rf"/home/newberry2/dhruvil/rhino/"
+option_data_path = rf"/home/newberry2/dhruvil/Current_Expiry_Month_OI_OHLC/"
+option_data_path1 = rf"/home/newberry2/dhruvil/Next_Monthly_OI_OHLC/"
+option_data_path2 = rf"/home/newberry2/dhruvil/Far_Month_Expiry_OI_OHLC/"
+
+expiry_file_path = rf"{root_path}/nifty_expiry_dates_main.xlsx"
+output_folder_path = rf'{root_path}/Trade_Sheets/split/'
+filter_df_path = rf"{root_path}/Filter_Sheets/"
+txt_file_path = rf'{root_path}/new_done.txt'
+runlog_path = rf"{root_path}/run_times.log"  # text log of timings
+
+
+os.makedirs(output_folder_path, exist_ok=True)
+os.makedirs(filter_df_path, exist_ok=True)
+open(txt_file_path, 'a').close()
+
+
+# ===================== CONFIG =====================
+
+date_ranges = [
+    ('2024-01-01', '2025-10-22'),
+]
+
+year = "final"
+
+LOT_SIZE = 75
+RHINO_LONG_LOTS = 24
+RHINO_SHORT_LOTS = 48
+CALENDAR_LOTS = 32
+RF_RATE = 0.067
+PERSIST_BARS = 3
+UNIVERSAL_EXIT_DTE = 15  # days
+ENTRY_DAY = 0            # Monday
+ENTRY_TIME_STR = "09:30"
+DELTA_TARGETS_RHINO = {
+    "leg1_long": 0.50,   # ~0.50Δ long put
+    "leg2_short": 0.35,  # <=0.35–0.40Δ short put
+    "leg3_long": 0.17    # <=0.2Δ long put
+}
+DELTA_TARGET_CAL = 0.40   # ~0.40Δ call for both legs
+# STRIKE_WIN_BELOW = 25
+# STRIKE_WIN_ABOVE = 15
+# ---- Day marker times (India market) ----
+DAY_OPEN_TIME = "09:30"
+DAY_EOD_TIME  = "15:15"
+
+PUT_WIN_BELOW  = 45   # wider below ATM (puts)
+PUT_WIN_ABOVE  = 25   # narrow above ATM (puts)
+CALL_WIN_BELOW = 25    # narrow below ATM (calls)
+CALL_WIN_ABOVE = 25   # wider above ATM (calls)
+
+STRIKE_STEP = 100   # force 100-point grid for selection
+
+
+# Trading session bounds used by minute fallback (NSE)
+MARKET_OPEN  = dt_time(9, 15)
+MARKET_CLOSE = dt_time(15, 30)
+
+MIN_IDX_MONTHLY, MIN_IDX_NEXT, MIN_IDX_FAR = {}, {}, {}
+
+# --- Posture caps by VIX regime ---
+MAX_RHINOS_PER_PID = 2
+MAX_CALENDARS_PER_PID = 1
+
+
+# Base frames for slicing from the minute index
+OPTION_DF_MONTHLY = None
+OPTION_DF_NEXT    = None
+OPTION_DF_FAR     = None
+
+
+# ================= Option math helpers =================
+def black_scholes_price(S, K, T, r, sigma, opt_type):
+    if sigma is None or sigma <= 0 or T <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2)*T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if opt_type.lower() == "call":
+        return S * norm.cdf(d1) - K * np.exp(-r*T)*norm.cdf(d2)
+    else:
+        return K * np.exp(-r*T)*norm.cdf(-d2) - S * norm.cdf(-d1)
+
+def implied_volatility(price, S, K, T, r, opt_type):
+    try:
+        return brentq(lambda sig: black_scholes_price(S,K,T,r,sig,opt_type) - price,
+                      1e-4, 3.0, maxiter=150)
+    except Exception:
+        return None
+
+def black_scholes_greeks(S, K, T, r, sigma, opt_type):
+    if sigma is None or sigma <= 0 or T <= 0:
+        return {'Delta': None, 'Gamma': None, 'Vega': None}
+    d1 = (np.log(S / K) + (r + 0.5*sigma**2)*T) / (sigma * np.sqrt(T))
+    if opt_type.lower() == 'call':
+        delta = norm.cdf(d1)
+    else:
+        # put delta is -Phi(-d1) which equals Phi(d1)-1; we keep explicit sign
+        delta = -norm.cdf(-d1)
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    vega = S * norm.pdf(d1) * np.sqrt(T)
+    return {'Delta': delta, 'Gamma': gamma, 'Vega': vega}
+
+def _iv_delta_worker(args):
+    """Pure worker for multiprocessing: returns (idx, T, Delta or np.nan)."""
+    i, px, spot, K, exp_ts, ref_dt, r, optype = args
+    # compute T using your existing helper
+    T, _ = calculate_time_to_expiry(exp_ts, ref_dt)
+    if T <= 0:
+        return (i, T, np.nan)
+    iv = iv_cached(px, spot, K, T, r, optype)
+    d  = delta_cached(spot, K, T, r, iv, optype)
+    return (i, T, (np.nan if d is None else d))
+
+
+def calculate_time_to_expiry(expiry_date, reference_datetime):
+    """Trading-day fraction using India hours 09:15–15:30; returns T in years and DTE (days)."""
+    # normalize both inputs to pd.Timestamp (handles str, numpy.datetime64, datetime, etc.)
+    try:
+        expiry_ts = pd.to_datetime(expiry_date)
+    except Exception:
+        expiry_ts = pd.to_datetime(str(expiry_date), errors='coerce')
+
+    try:
+        ref_ts = pd.to_datetime(reference_datetime)
+    except Exception:
+        ref_ts = pd.to_datetime(str(reference_datetime), errors='coerce')
+
+    # guard NaT
+    if pd.isna(expiry_ts) or pd.isna(ref_ts):
+        return 0.0, 0
+
+    market_open = dt_time(9, 15)
+    market_close = dt_time(15, 30)
+    full_day_minutes = (market_close.hour*60 + market_close.minute) - (market_open.hour*60 + market_open.minute)
+
+    # minutes left today (clamped to trading session)
+    minutes_since_open = (ref_ts.hour * 60 + ref_ts.minute) - (market_open.hour * 60 + market_open.minute)
+    minutes_left_today = max(0, full_day_minutes - max(0, minutes_since_open))
+    fraction_today = minutes_left_today / full_day_minutes if minutes_left_today > 0 else 0
+
+    total_days = (expiry_ts.date() - ref_ts.date()).days
+    full_days_after = max(0, total_days - 1)
+    trading_days = fraction_today + full_days_after
+
+    T_years = round(trading_days / 365, 6)
+    dte_days = int(full_days_after + (1 if fraction_today > 0 else 0))
+    return T_years, dte_days
+
+# ---- Snapshot & tier caches (logic-preserving) ----
+
+def max_allowed_rhinos() -> int:
+    return MAX_RHINOS_PER_PID
+
+def max_allowed_calendars() -> int:
+    return MAX_CALENDARS_PER_PID
+
+def calendar_count(pid: str) -> int:
+    ensure_group(pid)
+    return 1 if position_groups[pid]["CAL"] is not None else 0
+
+def build_leg_snapshot_exact(
+    tier: str,
+    date,            # datetime.date or 'YYYY-MM-DD'
+    time_str: str,   # 'HH:MM'
+    expiry,          # Timestamp/str/date
+    strike: float,
+    kind: str,       # 'put' or 'call'
+    spot: float,
+    max_lookback: int = 600  # big enough to reach back to 09:15 from EOD
+):
+    """
+    Returns a dict with price, delta, expiry, and t_eff by walking back minute-by-minute
+    on the SAME day for THIS instrument (tier/date/time/expiry/strike/kind).
+    If not found within max_lookback, returns None.
+    """
+    date_d   = pd.to_datetime(date).date()
+    expiry_t = pd.to_datetime(expiry, errors='coerce')
+    if pd.isna(expiry_t):
+        return None
+
+    px, t_eff = _price_for_iv(tier, date_d, time_str, expiry_t, strike, kind, max_lookback=max_lookback)
+    if px is None:
+        return None
+
+    ref_dt_eff = pd.to_datetime(f"{date_d} {t_eff}")
+    T_eff, _ = calculate_time_to_expiry(expiry_t, ref_dt_eff)
+    iv_eff = iv_cached(float(px), float(spot), float(strike), T_eff, RF_RATE, kind)
+    d_eff  = delta_cached(float(spot), float(strike), T_eff, RF_RATE, iv_eff, kind)
+
+    return {
+        'strike': float(strike),
+        'price' : float(px),    # ← this is the *fill* and the IV/Δ minute
+        'delta' : (None if d_eff is None else float(d_eff)),
+        'expiry': expiry_t.date(),
+        't_eff' : t_eff
+    }
+
+def first_free_rhino_slot_env(pid: str):
+    ensure_group(pid)
+    if rhino_slots_count(pid) >= MAX_RHINOS_PER_PID:
+        return None
+    for slot in ("R1", "R2"):
+        if position_groups[pid][slot] is None:
+            return slot
+    return None
+
+
+_SNAP_ROW_CACHE = {}          # (date, time, expiry, strike, kind) -> {'price','delta','Expiry','strike'}
+_RESOLVE_TIER_CACHE = {}      # (date, expiry) -> 'monthly'|'next'|'far'
+
+def _key_norm(date_, time_str, expiry, strike, kind):
+    return (pd.to_datetime(date_).date(),
+            str(time_str),
+            pd.to_datetime(expiry).date(),
+            float(strike),
+            str(kind).lower())
+
+def resolve_chain_for_expiry_cached(date_, mapped_days_row, expiry_target,
+                                    option_data, option_data1, option_data2):
+    d_key = pd.to_datetime(date_, errors='coerce')
+    e_key = pd.to_datetime(expiry_target, errors='coerce')
+    # Build a safe cache key
+    k = ((None if pd.isna(d_key) else d_key.normalize().date()),
+         (None if pd.isna(e_key) else e_key.normalize().date()))
+
+    if k not in _RESOLVE_TIER_CACHE:
+        _, tier = resolve_chain_for_expiry(date_, mapped_days_row, expiry_target,
+                                           option_data, option_data1, option_data2)
+        _RESOLVE_TIER_CACHE[k] = tier
+
+    tier = _RESOLVE_TIER_CACHE[k]
+    df_map = {'monthly': option_data, 'next': option_data1, 'far': option_data2}
+    df = df_map.get(tier, option_data)
+    return df, tier
+
+def _price_for_iv(tier: str, date, time_str: str, expiry, strike, kind, max_lookback: int = 300):
+    """
+    Return (price, effective_time_str) by scanning **minute-by-minute backwards**
+    within the same trading day for the exact instrument (strike/expiry/kind),
+    using only that minute's Open. No OHLC fallbacks.
+    """
+    strike = float(strike)
+    kind   = str(kind).lower()
+    dte    = pd.to_datetime(date).date()
+
+    def _pick(min_df):
+        if min_df is None or min_df.empty:
+            return None
+        r = min_df[
+            (pd.to_numeric(min_df['StrikePrice'], errors='coerce') == strike) &
+            (pd.to_datetime(min_df['ExpiryDate']).dt.date == pd.to_datetime(expiry).date()) &
+            (min_df['Type'].astype(str).str.lower() == kind)
+        ]
+        if r.empty:
+            return None
+        px = r.iloc[0].get('Open', np.nan)
+        if pd.notna(px) and float(px) > 0:
+            return float(px)
+        return None
+
+    # check exact minute
+    ch = get_chain_minute_fast(tier, dte, time_str, fallback=False)
+    px = _pick(ch)
+    if px is not None:
+        return px, time_str
+
+    # strict minute-by-minute walkback, stop at 09:15
+    hh, mm = map(int, time_str.split(":"))
+    steps = 0
+    while steps < int(max_lookback):
+        mm -= 1
+        if mm < 0:
+            mm = 59
+            hh -= 1
+        if (hh < 9) or (hh == 9 and mm < 15):
+            break
+        t_try = f"{hh:02d}:{mm:02d}"
+        ch = get_chain_minute_fast(tier, dte, t_try, fallback=False)
+        px = _pick(ch)
+        if px is not None:
+            return px, t_try
+        steps += 1
+
+    return None, None
+
+
+def get_chain_minute_fast(tier, date, time_str, fallback=True, max_lookback=30):
+    """
+    Return the minute slice as a DataFrame by slicing from the single base DF,
+    using (start,end) from the minute index map. Backward minute walkback unchanged.
+    """
+    if tier == 'monthly':
+        idx_map = MIN_IDX_MONTHLY
+        base_df = OPTION_DF_MONTHLY
+    elif tier == 'next':
+        idx_map = MIN_IDX_NEXT
+        base_df = OPTION_DF_NEXT
+    else:
+        idx_map = MIN_IDX_FAR
+        base_df = OPTION_DF_FAR
+
+    if base_df is None or not len(base_df):
+        return pd.DataFrame()
+
+    d = pd.to_datetime(date).date()
+
+    def _slice(d_, t_):
+        se = idx_map.get((d_, t_))
+        if se is None:
+            return pd.DataFrame()
+        s, e = se
+        # This is a *view slice* over the single master df
+        return base_df.iloc[s:e]
+
+    # exact minute first
+    df = _slice(d, time_str)
+    if not df.empty:
+        return df
+
+    if not fallback:
+        return pd.DataFrame()
+
+    # minute-by-minute walkback, identical to your old logic
+    try:
+        hh, mm = map(int, time_str.split(":"))
+    except Exception:
+        return pd.DataFrame()
+
+    open_hh, open_mm = MARKET_OPEN.hour, MARKET_OPEN.minute
+    steps = 0
+    cur_hh, cur_mm = hh, mm
+    while steps < int(max_lookback):
+        cur_mm -= 1
+        if cur_mm < 0:
+            cur_mm = 59
+            cur_hh -= 1
+        if (cur_hh < open_hh) or (cur_hh == open_hh and cur_mm < open_mm):
+            break
+        t_try = f"{cur_hh:02d}:{cur_mm:02d}"
+        df = _slice(d, t_try)
+        if not df.empty:
+            return df
+        steps += 1
+
+    return pd.DataFrame()
+
+# Build minute indices for O(1) minute access (per range)
+def _build_minute_index_positions(option_df: pd.DataFrame):
+    """
+    Build a dict: (date, 'HH:MM') -> (start_row, end_row) *in the same option_df*.
+    Returns both the map and the original (sorted) df so callers can slice via .iloc.
+    """
+    # Keep only columns we actually use for the strategy (saves memory)
+    cols_keep = ['Date', 'Time', 'ExpiryDate', 'StrikePrice', 'Type', 'Open']
+    existing  = [c for c in cols_keep if c in option_df.columns]
+    df = option_df[existing].copy()  # one master copy per tier
+
+    # Normalize types once
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df['ExpiryDate'] = pd.to_datetime(df['ExpiryDate'], errors='coerce')
+    df['Time'] = df['Time'].astype(str).str.slice(0,5)
+    df['StrikePrice'] = pd.to_numeric(df['StrikePrice'], errors='coerce')
+    df['Open'] = pd.to_numeric(df['Open'], errors='coerce')
+
+    # Sort once to make .iloc slicing contiguous
+    df.sort_values(['Date','Time'], kind='mergesort', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Build (start,end) ranges per (date, time)
+    idx_map = {}
+    # We use positions from the sorted df
+    dts = df['Date'].dt.date.to_numpy()
+    tms = df['Time'].to_numpy()
+
+    # fast single pass: record boundaries
+    start = 0
+    n = len(df)
+    while start < n:
+        cur_d = dts[start]
+        cur_t = tms[start]
+        end = start + 1
+        while end < n and dts[end] == cur_d and tms[end] == cur_t:
+            end += 1
+        idx_map[(cur_d, cur_t)] = (start, end)
+        start = end
+
+    return df, idx_map
+
+def _recent_strike_universe(
+    tier: str,
+    date,                 # 'YYYY-MM-DD' or date
+    time_str: str,        # 'HH:MM'
+    expiry,               # Timestamp/str/date
+    optype: str,          # 'put' or 'call'
+    recent_minutes: int = 10,
+):
+    """
+    Union of strikes for (expiry, optype) seen at/within the last `recent_minutes`
+    strictly *backward* from time_str (same day, same tier).
+    Strikes are normalized to your grid (STRIKE_STEP).
+    """
+    assert optype in ('put', 'call')
+    date_d    = pd.to_datetime(date).date()
+    expiry_ts = pd.to_datetime(expiry)
+
+    # Start with the current minute (with small fallback for this slice only)
+    ch0 = get_chain_minute_fast(tier, date_d, time_str, fallback=True, max_lookback=15)
+    pool = []
+    if ch0 is not None and not ch0.empty:
+        pool.append(ch0)
+
+    # Walk back recent_minutes (no forward peeking)
+    try:
+        hh, mm = map(int, time_str.split(":"))
+    except Exception:
+        hh, mm = 9, 30
+
+    steps = 0
+    while steps < int(recent_minutes):
+        mm -= 1
+        if mm < 0:
+            mm = 59
+            hh -= 1
+        # NSE guard (09:15 lower bound)
+        if (hh < 9) or (hh == 9 and mm < 15):
+            break
+
+        t_try = f"{hh:02d}:{mm:02d}"
+        ch_prev = get_chain_minute_fast(tier, date_d, t_try, fallback=False)
+        if ch_prev is not None and not ch_prev.empty:
+            pool.append(ch_prev)
+        steps += 1
+
+    if not pool:
+        return []
+
+    # Filter to this expiry & type, union strikes, normalize to step grid
+    strikes_set = set()
+    for dfm in pool:
+        dfm = dfm[
+            (pd.to_datetime(dfm['ExpiryDate']).dt.date == expiry_ts.date()) &
+            (dfm['Type'].str.lower() == optype)
+        ]
+        if not dfm.empty:
+            strikes_set.update(pd.to_numeric(dfm['StrikePrice'], errors='coerce').dropna().tolist())
+
+    # Keep only valid grid strikes
+    strikes = sorted([float(k) for k in strikes_set if _is_valid_step_strike(k, STRIKE_STEP)])
+    return strikes
+
+def pick_long2_by_delta_smart(
+    tier: str,
+    date,                   # 'YYYY-MM-DD' or date
+    time_str: str,          # 'HH:MM'
+    expiry,                 # Timestamp/str
+    spot: float,
+    target_delta: float = -0.17,         # strict boundary
+    relax_lower: float = -0.21,          # relaxation band lower bound (exclusive)
+    recent_minutes: int = 10,            # backward look window for strike universe
+    max_walkback: int = 300,             # per-instrument minute walkback for a price
+    rf: float = RF_RATE,
+):
+    """
+    PUT long2 selector:
+      Stage A: pick Δ < target_delta (e.g., < -0.17), closest to target from below.
+      Stage B: if A empty, pick Δ in (relax_lower, target_delta), closest to target from below.
+      Tie-breakers: smaller |K-spot|, then lower K (puts).
+      No wing guard.
+      Returns: {StrikePrice, ExpiryDate, Price, Delta, t_eff} or None.
+    """
+    assert target_delta < 0.0, "target_delta should be negative for puts"
+    assert relax_lower < target_delta, "relax_lower must be below target_delta (e.g., -0.21 < -0.17)"
+
+    date_d    = pd.to_datetime(date).date()
+    expiry_ts = pd.to_datetime(expiry)
+
+    # 1) Build recent strike universe
+    strikes = _recent_strike_universe(
+        tier=tier, date=date, time_str=time_str, expiry=expiry_ts, optype='put',
+        recent_minutes=int(recent_minutes)
+    )
+    if not strikes:
+        return None
+
+    # 2) For each strike, strict minute walkback for this instrument to get price, then IV/Δ
+    A = []   # strict Δ < target
+    B = []   # relax_lower < Δ < target
+
+    for K in strikes:
+        px, t_eff = _price_for_iv(
+            tier, date_d, time_str, expiry_ts, K, 'put', max_lookback=int(max_walkback)
+        )
+        if px is None:
+            continue
+
+        ref_dt_eff = pd.to_datetime(f"{date_d} {t_eff}")
+        T_eff, _   = calculate_time_to_expiry(expiry_ts, ref_dt_eff)
+        iv_eff     = iv_cached(float(px), float(spot), float(K), T_eff, rf, 'put')
+        d_eff      = delta_cached(float(spot), float(K), T_eff, rf, iv_eff, 'put')
+        if d_eff is None:
+            continue
+
+        d = float(d_eff)
+
+        # Stage A: strict Δ < target
+        if d < float(target_delta):
+            A.append( (d, K, px, t_eff) )
+        # Stage B: allow corridor (relax_lower, target_delta)
+        elif (d > float(relax_lower)) and (d < float(target_delta)):
+            B.append( (d, K, px, t_eff) )
+        # else ignore (>= target or <= relax_lower)
+
+    def _choose(cands):
+        if not cands:
+            return None
+        # rank: (distance to target from below), |K-spot|, then lower K first (puts)
+        ranked = sorted(
+            cands,
+            key=lambda tup: (abs(tup[0] - float(target_delta)), abs(float(tup[1]) - float(spot)), -float(tup[1]))
+        )
+        d, K, px, t_eff = ranked[0]
+        return {
+            'StrikePrice': float(K),
+            'ExpiryDate' : expiry_ts,
+            'Price'      : float(px),
+            'Delta'      : float(d),
+            't_eff'      : t_eff
+        }
+
+    # 3) Stage A first, then Stage B if A empty
+    pick = _choose(A)
+    if pick is not None:
+        return pick
+    return _choose(B)
+
+# change signature
+def snapshot_row(chain_minute_df, ref_dt, expiry, strike, kind, spot, rf=RF_RATE):
+    key = (_key_norm(ref_dt.date(), ref_dt.strftime("%H:%M"), expiry, strike, kind))
+    if key in _SNAP_ROW_CACHE:
+        return _SNAP_ROW_CACHE[key]
+    if chain_minute_df.empty:
+        return {}
+
+    exp_date = pd.to_datetime(expiry).date()
+    row = chain_minute_df[
+        (chain_minute_df['StrikePrice'] == float(strike)) &
+        (chain_minute_df['Type'].str.lower() == str(kind).lower()) &
+        (pd.to_datetime(chain_minute_df['ExpiryDate']).dt.date == exp_date)
+    ]
+    if row.empty:
+        return {}
+
+    r0 = row.iloc[0]
+    T, _ = calculate_time_to_expiry(pd.to_datetime(r0['ExpiryDate']), ref_dt)
+
+    # AFTER (Open-only)
+    price = r0.get('Open', np.nan)
+    if (not pd.notna(price)) or float(price) <= 0:
+        return {}  # no OHLC fallback
+    price = float(price)
+
+
+    iv = iv_cached(price, float(spot), float(strike), T, rf, str(kind))
+    d  = delta_cached(float(spot), float(strike), T, rf, iv, str(kind))
+
+    out = {
+        'strike': float(strike),
+        'delta': None if d is None else float(d),
+        'price': price,                           # exact minute price only
+        'expiry': pd.to_datetime(r0['ExpiryDate']).date()
+    }
+    _SNAP_ROW_CACHE[key] = out
+    return out
+
+
+def _clear_snapshot_caches():
+    _SNAP_ROW_CACHE.clear()
+    _RESOLVE_TIER_CACHE.clear()
+
+# Tracks which slots are occupied per PositionID
+
+def make_pid(expiry_ts: pd.Timestamp) -> str:
+    return f"PID-{pd.to_datetime(expiry_ts).strftime('%Y%m%d')}"
+
+position_groups = {}  # { pid: {"R1": sid_or_None, "R2": sid_or_None, "CAL": sid_or_None} }
+
+def _min(x: float) -> float:
+    return x / 60.0
+
+def build_lifecycle_from_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build per-leg lifecycle from your 'summary' CSV (columns exactly as you pasted).
+
+    Uses:
+      Date, Time, StructureID, Slot, Type, Action, LegRole, Spot,
+      long1_*, short_*, long2_*, cal_short_*, cal_long_*.
+
+    Rules:
+      - SID = StructureID | Slot
+      - Maintain a LIFO stack of OPEN frames per SID (per 'Type').
+      - On OPEN: capture entry snapshot for any roles present on that row.
+      - On EXIT/UNIVERSAL_EXIT: close only the roles that have an exit price
+        on that row (or the role named by LegRole), compute P&L using lots and LOT_SIZE.
+      - Pop the frame once all its roles are closed. Instance number stays pinned
+        to the frame from its OPEN to its final exit(s).
+    """
+    if summary_df is None or summary_df.empty:
+        return pd.DataFrame()
+
+    df = summary_df.copy()
+
+    # normalize date/time
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df['Time'] = df['Time'].astype(str).str[:5]  # "HH:MM"
+
+    # SID
+    def sid_of(r):
+        sid = str(r.get('StructureID', ''))
+        slot = r.get('Slot', '')
+        if pd.notna(slot) and str(slot) != '':
+            sid += '|' + str(slot)
+        return sid
+    df['SID'] = df.apply(sid_of, axis=1)
+
+    # Only rows we care about
+    care = df['Type'].isin(['rhino','calendar']) & df['Action'].notna()
+    df = df[care].copy()
+
+    # Sort with EXIT before OPEN if same timestamp
+    def _action_rank(a: str) -> int:
+        a = a.upper()
+        if a.startswith(('EXIT','UNIVERSAL_EXIT')):
+            return 0
+        if a.startswith('OPEN'):
+            return 1
+        return 2  # anything else (will be ignored later)
+    df['_ord'] = df['Action'].apply(_action_rank)
+    df = df.sort_values(['Date','Time','_ord'], kind='mergesort').drop(columns=['_ord'])
+
+    # Role configs (prices are *_Price; expiry/delta/strike exist similarly)
+    role_cfg = {
+        'rhino': {
+            'roles': ['long1','short','long2'],
+            'lots' : {'long1': RHINO_LONG_LOTS, 'short': RHINO_SHORT_LOTS, 'long2': RHINO_LONG_LOTS},
+            'dir'  : {'long1': +1,            'short': -1,               'long2': +1}
+        },
+        'calendar': {
+            'roles': ['cal_short','cal_long'],
+            'lots' : {'cal_short': CALENDAR_LOTS, 'cal_long': CALENDAR_LOTS},
+            'dir'  : {'cal_short': -1,            'cal_long': +1}
+        }
+    }
+
+    # Per-SID stack of frames
+    open_state = {}             # sid -> [frame, ...]
+    sid_next_instance = {}      # sid -> int
+    out = []
+
+    def rhino_month_from_pid(pid_val: str) -> str:
+        try:
+            dt = pd.to_datetime(str(pid_val).replace('PID-',''), format='%Y%m%d', errors='coerce')
+            return "" if pd.isna(dt) else str(pd.Period(dt, freq='M'))
+        except Exception:
+            return ""
+
+    for _, row in df.iterrows():
+        stype = str(row['Type'])
+        act = str(row['Action']).upper()
+        if stype not in role_cfg:
+            continue
+
+        sid = row['SID']
+        roles = role_cfg[stype]['roles']
+        lots_map, dir_map = role_cfg[stype]['lots'], role_cfg[stype]['dir']
+
+        # -------- OPEN --------
+        if act.startswith('OPEN'):
+            frame = {'meta': row.copy(), 'roles': {}, 'stype': stype}
+            inst = sid_next_instance.get(sid, 0) + 1
+            sid_next_instance[sid] = inst
+            frame['instance'] = inst
+
+            for role in roles:
+                px = row.get(f'{role}_Price', np.nan)
+                if pd.notna(px):
+                    frame['roles'][role] = (
+                        float(px),
+                        pd.to_datetime(row.get(f'{role}_Expiry', pd.NaT), errors='coerce'),
+                        float(row.get(f'{role}_Delta', np.nan)) if pd.notna(row.get(f'{role}_Delta', np.nan)) else np.nan,
+                        float(row.get(f'{role}_Strike', np.nan)) if pd.notna(row.get(f'{role}_Strike', np.nan)) else np.nan
+                    )
+            if frame['roles']:
+                open_state.setdefault(sid, []).append(frame)
+            continue
+
+        # -------- EXIT / UNIVERSAL_EXIT (legged) --------
+        if not act.startswith(('EXIT','UNIVERSAL_EXIT')):
+            # ignore any other actions (e.g., exceptions)
+            continue
+        if sid not in open_state or not open_state[sid]:
+            # unmatched exit—skip
+            continue
+
+        frame = open_state[sid][-1]
+        open_meta = frame['meta']
+        open_legs = frame['roles']
+        instance = frame['instance']
+        rhino_month = rhino_month_from_pid(open_meta.get('StructureID',''))
+
+        # Decide which roles to close on this row
+        leg_hint = str(row.get('LegRole', '') or '')
+
+        if act.startswith(('EXIT', 'UNIVERSAL_EXIT')):
+            # Full-structure exit: close ALL legs still open in the frame
+            close_roles = list(open_legs.keys())
+        elif act.startswith('LEG_EXIT') and leg_hint in roles:
+            # Optional single-leg exits if you ever use LEG_EXIT
+            close_roles = [leg_hint]
+        else:
+            # Fallback: close any roles that present an exit price now
+            close_roles = [role for role in roles
+                           if pd.notna(row.get(f'{role}_Price', np.nan))]
+
+        # Emit rows for each closing role
+        exited = []
+        for role in close_roles:
+            if role not in open_legs:
+                continue  # already closed or wasn't opened
+
+            e_px, e_exp, e_del, e_strk = open_legs[role]
+            x_px  = row.get(f'{role}_Price', np.nan)
+            x_del = row.get(f'{role}_Delta', np.nan)
+
+            qty = float(lots_map[role]) * float(LOT_SIZE)
+            direction = dir_map[role]
+
+            pnl = np.nan
+            if pd.notna(x_px):
+                pnl = (float(x_px) - float(e_px)) * float(direction) * qty
+
+            out.append({
+                'PID'         : open_meta.get('StructureID'),
+                'Rhino_month' : rhino_month,
+                'Instance'    : instance,
+
+                'Entry Date'  : open_meta['Date'],
+                'Entry Time'  : open_meta['Time'],
+                'Quantity'    : qty,
+                'Expirydate'  : e_exp,
+                'Strike'      : e_strk,
+                'Type'        : role,
+
+                'Entry Price' : float(e_px),
+                'Entry Delta' : e_del,
+
+                'Exit Date'   : row['Date'],
+                'Exit Time'   : row['Time'],
+                'Exit Price'  : (float(x_px) if pd.notna(x_px) else np.nan),
+                'Exit Delta'  : (float(x_del) if pd.notna(x_del) else np.nan),
+
+                'P&L'         : (float(pnl) if pd.notna(pnl) else np.nan),
+            })
+            exited.append(role)
+
+
+        # Remove exited roles from the frame
+        for r in exited:
+            open_legs.pop(r, None)
+
+        # If all legs closed, pop the frame
+        if not open_legs:
+            open_state[sid].pop()
+            if not open_state[sid]:
+                open_state.pop(sid, None)
+
+    lf = pd.DataFrame(out)
+    if not lf.empty:
+        lf = lf.sort_values(['Entry Date','Entry Time','PID','Instance','Type'], kind='mergesort').reset_index(drop=True)
+    return lf
+
+def _ensure_dt_time_cols(df):
+    out = df.copy()
+    if 'Date' in out.columns:
+        out['Date'] = pd.to_datetime(out['Date'], errors='coerce')
+    if 'Time' in out.columns:
+        out['Time'] = out['Time'].astype(str).str.slice(0, 5)  # HH:MM
+    # Build TS if possible
+    if 'Date' in out.columns and 'Time' in out.columns and 'TS' not in out.columns:
+        try:
+            out['TS'] = pd.to_datetime(out['Date'].dt.date.astype(str) + ' ' + out['Time'],
+                                       errors='coerce')
+        except Exception:
+            pass
+    return out
+
+def sort_by_date_time_pid(df):
+    """
+    Stable sort. Prefer TS if available; otherwise Date→Time.
+    Append PID to the sort keys only if that column exists.
+    """
+    out = _ensure_dt_time_cols(df)
+
+    by = []
+    if 'TS' in out.columns and out['TS'].notna().any():
+        by.append('TS')
+    else:
+        if 'Date' in out.columns:
+            by.append('Date')
+        if 'Time' in out.columns:
+            by.append('Time')
+    if 'PID' in out.columns:
+        by.append('PID')
+
+    # If nothing to sort by, return as-is
+    if not by:
+        return out.reset_index(drop=True)
+
+    return out.sort_values(by, kind='mergesort').reset_index(drop=True)
+
+def ensure_group(pid: str):
+    if pid not in position_groups:
+        position_groups[pid] = {"R1": None, "R2": None, "CAL": None}
+
+def first_free_rhino_slot(pid: str):
+    ensure_group(pid)
+    for slot in ("R1", "R2"):
+        if position_groups[pid][slot] is None:
+            return slot
+    return None
+
+def rhino_slots_count(pid: str):
+    ensure_group(pid)
+    return sum(1 for s in ("R1","R2") if position_groups[pid][s] is not None)
+
+def calendar_exists(pid: str):
+    ensure_group(pid)
+    return position_groups[pid]["CAL"] is not None
+
+def count_open_rhinos_for_pid(open_structs, pid: str) -> int:
+    return sum(1 for s in open_structs
+               if s.stype == "rhino" and s.status == "open" and s.pid == pid)
+
+# --- Debug/toggles (printing only; no logic impact) ---
+DEBUG = False
+PRINT_CANDIDATES = False          # show per-minute candidate lists
+PRINT_CANDIDATE_COUNTS = False    # show candidate strike counts/coverage
+PRINT_PNL_SUMMARY = False         # print per-PID PnL summary (final/max/min with times)
+SHOW_PNL_SUMMARY = False   # set False to silence the console summary
+
+def dbg(tag, **kw):
+    """Tiny debug printer."""
+    if not DEBUG:
+        return
+    parts = [f"{k}={v}" for k, v in kw.items()]
+    print(f"[{tag}] " + " | ".join(parts))
+
+def log_time(msg: str):
+    """Print to console and append to a log file."""
+    print(msg)
+    try:
+        with open(runlog_path, "a") as f:
+            f.write(msg + "\n")
+    except Exception as e:
+        print(f"[log_time] failed to write: {e}")
+
+def _debug_print_candidates(chain_minute_df, spot, ref_dt):
+    """
+    Print candidate strikes (with Δ and price) for PUT/CALL windows
+    around ATM using your global window constants.
+    """
+    if not PRINT_CANDIDATES:
+        return
+    if chain_minute_df is None or chain_minute_df.empty:
+        print(f"[CANDIDATES] {ref_dt} | No chain minute rows.")
+        return
+
+    # Build a sorted strike list from this minute
+    strikes_all = _strike_list_for_minute(chain_minute_df)
+    if not strikes_all:
+        print(f"[CANDIDATES] {ref_dt} | No strikes in chain minute.")
+        return
+
+    atm = get_atm_strike(strikes_all, spot)
+
+    def _dump(optype, lower, upper, label):
+        # Window of strikes around ATM using your window constants
+        window = set(get_strike_window(strikes_all, spot, lower, upper))
+        # Filter rows for this optype and window
+        df = chain_minute_df[
+            (chain_minute_df['Type'].str.lower() == optype) &
+            (chain_minute_df['StrikePrice'].isin(window))
+        ].copy()
+
+        rows = []
+        for _, r in df.iterrows():
+            K = float(r['StrikePrice'])
+            price = float(r['Open'])
+            T, _ = calculate_time_to_expiry(pd.to_datetime(r['ExpiryDate']), ref_dt)
+            iv = iv_cached(price, float(spot), K, T, RF_RATE, optype)
+            d  = delta_cached(float(spot), K, T, RF_RATE, iv, optype)
+            rows.append((K, d, price))
+
+        rows.sort(key=lambda x: x[0])  # sort by strike
+        # Pretty print
+        print(
+            f"[CANDIDATES] {ref_dt.strftime('%Y-%m-%d %H:%M')} | Spot={float(spot):.2f} | "
+            f"ATM={atm} | {label} ({optype.upper()})"
+        )
+
+        if not rows:
+            print("  (none)")
+        else:
+            for K, d, px in rows:
+                d_str = "NA" if d is None else f"{d:.6f}"
+                print(f"  Strike={int(K):<7}  Δ={d_str:<12}  Px={px}")
+
+    # PUT windows
+    _dump('put',  PUT_WIN_BELOW,  PUT_WIN_ABOVE,  f"PUT_WIN_BELOW={PUT_WIN_BELOW}, PUT_WIN_ABOVE={PUT_WIN_ABOVE}")
+    # CALL windows
+    _dump('call', CALL_WIN_BELOW, CALL_WIN_ABOVE, f"CALL_WIN_BELOW={CALL_WIN_BELOW}, CALL_WIN_ABOVE={CALL_WIN_ABOVE}")
+
+def _debug_print_candidate_counts(
+    chain_minute_df,
+    chain_all_df,
+    spot,
+    ref_dt,
+    label,
+    exp_target=None,          # 👈 pass the expiry you're targeting (Timestamp/str/date)
+    show_missing=True,        # 👈 print which strikes are missing from this minute
+    max_list=60               # 👈 cap how many missing strikes we print
+):
+    """
+    Print ATM, SPOT, and counts of strikes below/at/above ATM for both PUT and CALL windows.
+
+    Improvements:
+      - Pins the universe to a specific expiry if exp_target is provided.
+      - Normalizes all strikes to ints for robust matching.
+      - Optionally prints the exact strikes in the window that are missing at this minute.
+    """
+
+    if not PRINT_CANDIDATE_COUNTS:
+        return
+    
+    if chain_all_df is None or chain_all_df.empty:
+        print(f"[CANDS-COUNT] {ref_dt:%Y-%m-%d %H:%M} | {label} | (no chain_all rows)")
+        return
+
+    day = pd.to_datetime(ref_dt).date()
+
+    day_slice = chain_all_df[chain_all_df['Date'].dt.date == day].copy()
+    if exp_target is not None:
+        exp_target = pd.to_datetime(exp_target).date()
+        day_slice = day_slice[pd.to_datetime(day_slice['ExpiryDate']).dt.date == exp_target]
+
+    # Normalize to int strikes
+    day_slice['StrikePrice'] = pd.to_numeric(day_slice['StrikePrice'], errors='coerce')
+    strikes_day = sorted({int(k) for k in day_slice['StrikePrice'].dropna().tolist()})
+    if not strikes_day:
+        print(f"[CANDS-COUNT] {ref_dt:%Y-%m-%d %H:%M} | {label} | (no strikes on day)")
+        return
+
+    atm = get_atm_strike(strikes_day, spot)
+
+    def _stats_for(optype, lower, upper):
+        window = get_strike_window(strikes_day, spot, lower, upper)
+        window = [int(k) for k in window]  # normalize to int
+
+        below = sum(1 for k in window if k < atm)
+        at    = sum(1 for k in window if k == atm)
+        above = sum(1 for k in window if k > atm)
+
+        if chain_minute_df is not None and not chain_minute_df.empty:
+            dfm = chain_minute_df.copy()
+            # restrict type
+            dfm = dfm[dfm['Type'].str.lower() == optype]
+            # restrict expiry if provided
+            if exp_target is not None and 'ExpiryDate' in dfm.columns:
+                dfm = dfm[pd.to_datetime(dfm['ExpiryDate']).dt.date == exp_target]
+            # normalize minute strikes to int
+            minute_strikes = {
+                int(x) for x in pd.to_numeric(dfm['StrikePrice'], errors='coerce').dropna().tolist()
+            }
+            present_minute = sum(1 for k in window if k in minute_strikes)
+            missing_list = [k for k in window if k not in minute_strikes]
+        else:
+            minute_strikes = set()
+            present_minute = 0
+            missing_list = list(window)
+
+        out = {
+            "total_in_window": len(window),
+            "below": below, "at": at, "above": above,
+            "present_minute": present_minute,
+            "missing_minute": len(window) - present_minute,
+            "window": window,
+            "minute_strikes": minute_strikes,
+            "missing_list": missing_list
+        }
+        return out
+
+    put_stats  = _stats_for('put',  PUT_WIN_BELOW,  PUT_WIN_ABOVE)
+    call_stats = _stats_for('call', CALL_WIN_BELOW, CALL_WIN_ABOVE)
+
+    print(f"[CANDS-COUNT] {ref_dt:%Y-%m-%d %H:%M} | {label}")
+    print(f"  SPOT={spot:.2f} | ATM={atm} | EXP={exp_target if exp_target else 'ALL-IN-TIER'}")
+
+    print(f"  PUT  win (below={PUT_WIN_BELOW}, above={PUT_WIN_ABOVE}): "
+          f"total={put_stats['total_in_window']}  below={put_stats['below']}  at={put_stats['at']}  above={put_stats['above']}  "
+          f"[present_minute={put_stats['present_minute']}, missing_minute={put_stats['missing_minute']}]")
+    if show_missing and put_stats['missing_list']:
+        miss = put_stats['missing_list'][:max_list]
+        ell  = " …" if len(put_stats['missing_list']) > max_list else ""
+        print(f"    PUT missing strikes: {miss}{ell}")
+
+    print(f"  CALL win (below={CALL_WIN_BELOW}, above={CALL_WIN_ABOVE}): "
+          f"total={call_stats['total_in_window']} below={call_stats['below']} at={call_stats['at']} above={call_stats['above']} "
+          f"[present_minute={call_stats['present_minute']}, missing_minute={call_stats['missing_minute']}]")
+    if show_missing and call_stats['missing_list']:
+        miss = call_stats['missing_list'][:max_list]
+        ell  = " …" if len(call_stats['missing_list']) > max_list else ""
+        print(f"    CALL missing strikes: {miss}{ell}")
+
+
+# ================= Utilities =================
+def normalize_option_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Minimal, memory-lean normalization. Works in-place-ish (on a copy of the 6 columns),
+    avoids building large temporary Series.
+    Keeps only: Date, Time, ExpiryDate, StrikePrice, Type, Open
+    """
+    keep = ['Date','Time','ExpiryDate','StrikePrice','Type','Open']
+    existing = [c for c in keep if c in df.columns]
+    out = df[existing].copy()  # small copy of 6 columns only
+
+    # Parse dates/times (vectorized, low memory)
+    out['Date'] = pd.to_datetime(out['Date'], errors='coerce')
+    # normalize 'HH:MM' without allocating many temporaries
+    out['Time'] = out['Time'].astype(str).str.slice(0,5)
+    out['ExpiryDate'] = pd.to_datetime(out['ExpiryDate'], errors='coerce')
+
+    # Numerics (already downcasted above, but ensure numeric)
+    out['StrikePrice'] = pd.to_numeric(out['StrikePrice'], errors='coerce').astype('float32')
+    out['Open']        = pd.to_numeric(out['Open'],        errors='coerce').astype('float32')
+
+    # Map Type to {'call','put'} with a tiny dict and drop bad rows
+    t = out['Type'].astype(str).str.strip().str.lower()
+    t = t.replace({'ce':'call','pe':'put'})
+    mask = t.isin(['call','put'])
+    if not mask.all():
+        # drop unexpected types without allocating a big "mapped"/"bad_mask"
+        out = out.loc[mask].copy()
+        t = t.loc[mask]
+    out['Type'] = t.astype('category')
+
+    return out
+
+
+def get_atm_strike(strikes, spot):
+    return min(strikes, key=lambda x: abs(x - spot))
+
+def _clear_strike_list_cache():
+    _STRIKE_LIST_CACHE.clear()
+
+# REPLACE the whole function with this:
+def get_strike_window(strikes, spot, lower, upper):
+    atm = get_atm_strike(strikes, spot)
+    sorted_strikes = sorted(strikes)
+    idx = sorted_strikes.index(atm)
+    start = max(0, idx - lower)
+    end = min(len(sorted_strikes), idx + upper + 1)
+    return sorted_strikes[start:end]
+
+_STRIKE_LIST_CACHE = {}  # key: id(df) -> sorted strike list
+
+def _is_valid_step_strike(k, step=STRIKE_STEP):
+    try:
+        return (int(round(float(k))) % step) == 0
+    except Exception:
+        return False
+
+def _filter_step_strikes(strike_list, step=STRIKE_STEP):
+    return sorted([float(k) for k in strike_list if _is_valid_step_strike(k, step)])
+
+
+def _strike_list_for_minute(df):
+    k = id(df)
+    lst = _STRIKE_LIST_CACHE.get(k)
+    if lst is None:
+        raw = pd.to_numeric(df['StrikePrice'], errors='coerce').dropna().unique().tolist()
+        lst = _filter_step_strikes(raw, STRIKE_STEP)  # keep only 100s
+        _STRIKE_LIST_CACHE[k] = lst
+    return lst
+
+
+def extract_option_chain_slice(option_minute_df, spot, optype=None):
+    strikes = _filter_step_strikes(
+        pd.to_numeric(option_minute_df['StrikePrice'], errors='coerce').dropna().unique().tolist(),
+        STRIKE_STEP
+    )
+    if optype == 'put':
+        window = set(get_strike_window(strikes, spot, lower=PUT_WIN_BELOW, upper=PUT_WIN_ABOVE))
+    elif optype == 'call':
+        window = set(get_strike_window(strikes, spot, lower=CALL_WIN_BELOW, upper=CALL_WIN_ABOVE))
+    else:
+        window = set(get_strike_window(strikes, spot, lower=PUT_WIN_BELOW, upper=PUT_WIN_ABOVE))
+    # boolean mask is faster than isin on Python set → make a numpy mask
+    mask = option_minute_df['StrikePrice'].isin(window)
+    return option_minute_df.loc[mask]
+
+def pick_leg_by_delta(slice_df, spot, r, ref_dt, target_delta, optype, direction):
+    df = slice_df[slice_df['Type'].str.lower() == optype].copy()
+    if df.empty:
+        return None
+
+    exp = pd.to_datetime(df['ExpiryDate']).values
+    strikes = df['StrikePrice'].values
+    px = df['Open'].values
+
+    n = len(df)
+    T_arr = np.empty(n, dtype=float)
+    D_arr = np.empty(n, dtype=float)
+    D_arr[:] = np.nan
+
+    # --- parallel path when pool is available & batch is worthwhile ---
+    use_pool = (DELTA_POOL is not None) and (n >= 32)  # threshold avoids overhead on tiny batches
+    if use_pool:
+        args_iter = (
+            (i, float(px[i]), float(spot), float(strikes[i]), exp[i], ref_dt, r, optype)
+            for i in range(n)
+        )
+        # chunksize heuristic keeps workers busy without too much overhead
+        chunksize = max(1, n // (4 * 4))
+        for i, T, d in DELTA_POOL.imap_unordered(_iv_delta_worker, args_iter, chunksize=chunksize):
+            T_arr[i] = T
+            if not (d is None or (isinstance(d, float) and np.isnan(d))):
+                D_arr[i] = d
+    else:
+        # --- serial fallback (small batches or no pool) ---
+        for i in range(n):
+            T, _ = calculate_time_to_expiry(exp[i], ref_dt)
+            iv = iv_cached(px[i], spot, strikes[i], T, r, optype)
+            d  = delta_cached(spot, strikes[i], T, r, iv, optype)
+            T_arr[i] = T
+            if d is not None:
+                D_arr[i] = d
+
+    df['T'] = T_arr
+    df['Delta'] = D_arr
+    df = df.dropna(subset=['Delta'])
+    df['abs_delta'] = np.abs(df['Delta'])
+
+    if direction == '>=':
+        cand = df[df['abs_delta'] >= abs(target_delta)].copy()
+    else:
+        cand = df[df['abs_delta'] <= abs(target_delta)].copy()
+    if cand.empty:
+        return None
+
+    cand['diff'] = (cand['abs_delta'] - abs(target_delta)).abs()
+    cand = cand.assign(dist2spot=(cand['StrikePrice'] - spot).abs())
+    sel = (cand.sort_values(['diff','dist2spot','StrikePrice'],
+            ascending=[True, True, (optype=='put')], kind='mergesort').iloc[0])
+    return sel
+
+
+def normalize_time_column(df):
+    def safe_parse(t):
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(str(t).strip(), fmt).strftime("%H:%M")
+            except:
+                continue
+        return None
+    out = df.copy()
+    out['Time'] = out['Time'].apply(safe_parse)
+    return out
+
+def is_first_trading_monday_930(cur_date, time_str, trading_dates):
+    if time_str != ENTRY_TIME_STR:
+        return False
+
+    # first calendar Monday of the month
+    first_mon = pd.date_range(
+        start=cur_date.replace(day=1),
+        end=cur_date.replace(day=28) + pd.offsets.MonthEnd(0),
+        freq="W-MON"
+    )[0].date()
+
+    # all trading days in this month on/after the first Monday
+    month_start = cur_date.replace(day=1)
+    month_end   = (pd.Timestamp(month_start) + pd.offsets.MonthEnd(0)).date()
+    candidates = sorted(d for d in trading_dates if first_mon <= d <= month_end)
+
+    # allow 09:30 entry on the *first available trading day* ≥ first Monday
+    return bool(candidates) and (cur_date == candidates[0])
+
+
+def _rf(x, n=8):  # round float for cache keys (reduces float-noise for lru_cache)
+    return None if x is None else round(float(x), n)
+
+@lru_cache(maxsize=50_000)
+def iv_cached(price, S, K, T, r, opt_type):
+    # hashable + stable args
+    return implied_volatility(_rf(price,6), _rf(S,6), _rf(K,2), _rf(T,8), _rf(r,6), str(opt_type))
+
+@lru_cache(maxsize=50_000)
+def delta_cached(S, K, T, r, iv, opt_type):
+    if iv is None or iv <= 0 or T <= 0:
+        return None
+    g = black_scholes_greeks(_rf(S,6), _rf(K,2), _rf(T,8), _rf(r,6), _rf(iv,6), str(opt_type))
+    return g.get('Delta', None)
+
+
+# ================== Position models ==================
+@dataclass
+class Leg:
+    kind: str            # "put" or "call"
+    role: str            # "long1"/"short"/"long2" or "cal_short"/"cal_long"
+    strike: float
+    expiry: pd.Timestamp
+    lots: int
+    entry_price: float
+    direction: int       # +1 long, -1 short
+
+@dataclass
+class Structure:
+    sid: str
+    stype: str           # "rhino" or "calendar"
+    opened_at: pd.Timestamp
+    expiry: pd.Timestamp
+    legs: list = field(default_factory=list)
+    status: str = "open"
+    counters: dict = field(default_factory=dict)  # keep only once
+    pid: str = ""        # PositionID (PID-YYYYMMDD)
+    slot: str = ""       # "R1"/"R2"/"CAL"
+
+    def reset_counter(self, key):
+        self.counters[key] = 0
+    def bump_counter(self, key):
+        self.counters[key] = self.counters.get(key, 0) + 1
+    def reached_persist(self, key):
+        return self.counters.get(key, 0) >= PERSIST_BARS
+
+
+@dataclass
+class EngineState:
+    open_structs: List[Structure]
+    pending_reopen: Dict[str, dict]
+    realised_by_pid: Dict[str, float]
+    last_tier_by_sid: Dict[str, str]
+
+class RowBuffer:
+    def __init__(self, path, columns=None, chunk=50_000, parquet=False):
+        self.path = path
+        self.columns = columns
+        self.chunk = int(chunk)
+        self.parquet = parquet
+        self._rows = []
+        self._wrote_header = False
+
+    def add(self, row: dict):
+        self._rows.append(row)
+        if len(self._rows) >= self.chunk:
+            self.flush()
+
+    def flush(self):
+        if not self._rows:
+            return
+        df = pd.DataFrame(self._rows)
+        if self.columns:
+            for c in self.columns:
+                if c not in df.columns:
+                    df[c] = pd.NA
+            df = df[self.columns]
+        if self.parquet:
+            # If you want parquet later, wire up a proper dataset writer.
+            raise NotImplementedError("Parquet append not wired. Use parquet=False.")
+        else:
+            df.to_csv(self.path, index=False, mode='a',
+                      header=(not self._wrote_header or not os.path.exists(self.path)))
+            self._wrote_header = True
+        self._rows.clear()
+
+    def close(self):
+        self.flush()
+
+
+def structure_pnl(st: Structure, exit_snapshot: dict) -> float:
+    """
+    Sum PnL across legs for this structure instance:
+    PnL_leg = (exit_price - entry_price) * direction * lots * LOT_SIZE
+    Uses Leg.entry_price for entry, and exit_snapshot[role]['price'] for exit.
+    """
+    total = 0.0
+    for lg in st.legs:
+        if lg.role not in exit_snapshot or 'price' not in exit_snapshot[lg.role]:
+            continue
+        px_in  = float(lg.entry_price)
+        px_out = float(exit_snapshot[lg.role]['price'])
+        leg_pnl = (px_out - px_in) * float(lg.direction) * float(lg.lots) * float(LOT_SIZE)
+        total += leg_pnl
+    return total
+
+# =========== Chain resolution: DAILY expiry alignment ===========
+def resolve_chain_for_expiry(date_, mapped_days_row, expiry_target,
+                             option_data, option_data1, option_data2):
+    """
+    Map a position's expiry to the correct option-chain tier for THIS date's mapping.
+    Prefers exact date matches; if none, chooses the nearest FUTURE tier, else nearest past.
+    """
+    # Robust parsing
+    tgt = pd.to_datetime(expiry_target, errors='coerce')
+    if pd.isna(tgt):
+        # Fallback: treat as monthly if target is unknown
+        return option_data, "monthly"
+    tgt_d = tgt.normalize().date()
+
+    # Pull & coerce mapping (guard NaT)
+    def _coerce(x): 
+        x = pd.to_datetime(mapped_days_row.get(x, pd.NaT), errors='coerce')
+        return x if not pd.isna(x) else pd.NaT
+
+    me = _coerce('MonthlyExpiry')
+    ne = _coerce('Next Monthly Expiry')
+    fe = _coerce('3rd Monthly Expiry')
+
+    # Exact matches first (most common path)
+    for exp, df, name in ((me, option_data, "monthly"),
+                          (ne, option_data1, "next"),
+                          (fe, option_data2, "far")):
+        if not pd.isna(exp) and exp.normalize().date() == tgt_d:
+            return df, name
+
+    # Build signed differences (days: future >= 0)
+    triples = []
+    if not pd.isna(me): triples.append(( (me.normalize().date() - tgt_d).days, option_data,  "monthly"))
+    if not pd.isna(ne): triples.append(( (ne.normalize().date() - tgt_d).days, option_data1, "next"))
+    if not pd.isna(fe): triples.append(( (fe.normalize().date() - tgt_d).days, option_data2, "far"))
+
+    if not triples:
+        # No mapping available at all → monthly fallback
+        return option_data, "monthly"
+
+    future = [t for t in triples if t[0] >= 0]
+    if future:
+        # nearest future tier
+        days, df, name = min(future, key=lambda x: x[0])
+        return df, name
+    else:
+        # all are in the past → pick the least negative (closest past)
+        days, df, name = max(triples, key=lambda x: x[0])
+        return df, name
+
+
+# ============== Delta-driven leg picking =================
+# ============== Minute-level snapshotting =================
+def _roles_for_type(stype):
+    return ('long1','short','long2') if str(stype).lower() == 'rhino' else ('cal_short','cal_long')
+
+
+
+def _snapshot_exit_backfilled(date, time_str, st, mapped_row,
+                              option_data, option_data1, option_data2,
+                              spot):
+    """
+    Build an exit snapshot for all legs with strict minute walkback,
+    computing IV/Δ off the same backfilled minute.
+    """
+    snap = {}
+    for role in ("long1", "short", "long2"):
+        lg = next((x for x in st.legs if x.role == role), None)
+        if lg is None:
+            continue
+
+        _, tier_leg = resolve_chain_for_expiry_cached(
+            date, mapped_row, lg.expiry, option_data, option_data1, option_data2
+        )
+
+        price, t_eff = _price_for_iv(
+            tier_leg, date, time_str, lg.expiry, lg.strike, lg.kind, max_lookback=300
+        )
+        if price is None:
+            continue
+
+        T_eff, _ = calculate_time_to_expiry(lg.expiry, pd.to_datetime(f"{date} {t_eff}"))
+        iv_eff = iv_cached(price, spot, lg.strike, T_eff, RF_RATE, lg.kind)
+        d_eff  = delta_cached(spot, lg.strike, T_eff, RF_RATE, iv_eff, lg.kind)
+
+        snap[role] = {
+            'strike': float(lg.strike),
+            'price' : float(price),
+            'delta' : d_eff,
+            'expiry': lg.expiry.date(),
+            't_eff' : t_eff
+        }
+    return snap
+
+def pick_long2_delta_lt_target(
+    tier: str,
+    date,                   # 'YYYY-MM-DD' or date
+    time_str: str,          # 'HH:MM'
+    expiry,                 # Timestamp/str
+    spot: float,
+    target_delta: float = -0.17,   # strict target on the signed Δ scale
+    short_strike: Optional[float] = None,
+    min_wing_pts: int = 200,       # require at least this many points between short and long2
+    max_wing_pts: Optional[int] = None,  # optional cap
+    max_lookback: int = 10
+):
+    """
+    Pick PUT long2 where:
+      - Delta is strictly < target_delta (e.g., < -0.17)
+      - Among those, minimize (target_delta - Delta)  [closest *from below*]
+      - Enforce wing guards vs short_strike (K_long2 < K_short and >= min wing)
+    Returns dict: {StrikePrice, ExpiryDate, Price, Delta, t_eff} or None.
+    """
+    assert target_delta < 0.0, "target_delta should be negative for puts (e.g., -0.17)"
+
+    expiry_ts = pd.to_datetime(expiry)
+    date_d    = pd.to_datetime(date).date()
+
+    ch_min = get_chain_minute_fast(tier, date_d, time_str, fallback=True, max_lookback=15)
+    if ch_min is None or ch_min.empty:
+        return None
+
+    dfm = ch_min[
+        (pd.to_datetime(ch_min['ExpiryDate']).dt.date == expiry_ts.date()) &
+        (ch_min['Type'].str.lower() == 'put')
+    ].copy()
+    if dfm.empty:
+        return None
+
+    strikes = pd.to_numeric(dfm['StrikePrice'], errors='coerce').dropna().astype(float).unique().tolist()
+    strikes = sorted([k for k in strikes if _is_valid_step_strike(k, STRIKE_STEP)])
+    if not strikes:
+        return None
+
+    if short_strike is not None:
+        try:
+            ss = float(short_strike)
+            strikes = [k for k in strikes if k < ss]
+        except Exception:
+            pass
+    if not strikes:
+        return None
+
+    def wing_ok(k2: float) -> bool:
+        if short_strike is None:
+            return True
+        k_short = float(short_strike)
+        if not (k2 < k_short):    # puts: wing must be below short
+            return False
+        wing = k_short - k2
+        if (min_wing_pts is not None) and (wing < float(min_wing_pts)):
+            return False
+        if (max_wing_pts is not None) and (wing > float(max_wing_pts)):
+            return False
+        return True
+
+    best = None
+    for K in strikes:
+        if not wing_ok(K):
+            continue
+        px, t_eff = _price_for_iv(tier, date_d, time_str, expiry_ts, K, 'put', max_lookback=max_lookback)
+        if px is None:
+            continue
+
+        ref_dt_eff = pd.to_datetime(f"{date_d} {t_eff}")
+        T_eff, _   = calculate_time_to_expiry(expiry_ts, ref_dt_eff)
+        iv_eff     = iv_cached(float(px), float(spot), float(K), T_eff, RF_RATE, 'put')
+        d_eff      = delta_cached(float(spot), float(K), T_eff, RF_RATE, iv_eff, 'put')
+        if d_eff is None:
+            continue
+
+        # STRICT rule: Delta must be < target_delta (e.g., < -0.17)
+        if not (float(d_eff) < float(target_delta)):
+            continue
+
+        # Rank: smallest positive (target_delta - d_eff) wins; then |K-spot|; then deeper OTM first (lower K)
+        gap = float(target_delta) - float(d_eff)   # > 0 when d_eff is below target
+        key = (gap, abs(float(K) - float(spot)), -float(K))
+
+        cand = {
+            'StrikePrice': float(K),
+            'ExpiryDate' : expiry_ts,
+            'Price'      : float(px),
+            'Delta'      : float(d_eff),
+            't_eff'      : t_eff
+        }
+        if (best is None) or (key < best[0]):
+            best = (key, cand)
+
+    return (None if best is None else dict(best[1]))
+
+def pick_leg_by_delta_walkback(
+    tier: str,
+    date,                   # e.g. pd.Timestamp.date() or str 'YYYY-MM-DD'
+    time_str: str,          # 'HH:MM'
+    expiry,                 # pd.Timestamp or str
+    spot: float,
+    optype: str,            # 'put' or 'call'
+    target_delta: float,
+    direction: str,         # '>=' or '<=' in |Δ|-space
+    base_lower: int,
+    base_upper: int,
+    max_extra: int = 10,
+    bias: str = 'below',
+    max_lookback: int = 10,   # for puts extend below first; for calls extend above first
+    tolerance: float = 0.0    # NEW: nearest-|Δ| fallback allowed within this abs tolerance (e.g. 0.03)
+):
+    """
+    Strike-by-strike selection with minute walkback *per instrument*:
+      1) Strict rule over a window around ATM (+ progressive extensions).
+      2) If strict fails everywhere, optionally pick the nearest-|Δ| candidate
+         provided |Δ|-difference <= `tolerance`.
+    Returns a dict: {StrikePrice, ExpiryDate, Price, Delta, t_eff, relaxed_pick?, tolerance?}
+    """
+    assert optype in ('put','call')
+    assert direction in ('>=','<=')
+
+    date_d    = pd.to_datetime(date).date()
+    expiry_ts = pd.to_datetime(expiry)
+
+    # get strikes from the minute chain (with a small fallback) so window centers on ATM properly
+    ch_min = get_chain_minute_fast(tier, date_d, time_str, fallback=True, max_lookback=15)
+    if ch_min is None or ch_min.empty:
+        return None
+
+    # restrict to this expiry & type from the target minute
+    dfm = ch_min[
+        (pd.to_datetime(ch_min['ExpiryDate']).dt.date == expiry_ts.date()) &
+        (ch_min['Type'].str.lower() == optype)
+    ].copy()
+
+    # union of strikes over the last `max_lookback` minutes (same-day)
+    strikes_set = set(pd.to_numeric(dfm['StrikePrice'], errors='coerce').dropna().tolist())
+
+    hh, mm = map(int, time_str.split(":"))
+    steps = 0
+    while steps < int(max_lookback):
+        mm -= 1
+        if mm < 0:
+            mm = 59
+            hh -= 1
+        if (hh < 9) or (hh == 9 and mm < 15):   # NSE open guard
+            break
+
+        t_try = f"{hh:02d}:{mm:02d}"
+        ch_prev = get_chain_minute_fast(tier, date_d, t_try, fallback=False)
+        if ch_prev is None or ch_prev.empty:
+            steps += 1
+            continue
+
+        dfp = ch_prev[
+            (pd.to_datetime(ch_prev['ExpiryDate']).dt.date == expiry_ts.date()) &
+            (ch_prev['Type'].str.lower() == optype)
+        ]
+        if not dfp.empty:
+            strikes_set.update(pd.to_numeric(dfp['StrikePrice'], errors='coerce').dropna().tolist())
+
+        steps += 1
+
+    # keep only 100-point strikes
+    strikes_all = _filter_step_strikes(strikes_set, STRIKE_STEP)
+    if not strikes_all:
+        return None
+
+    prefer_below_first = (bias == 'below')
+
+    # best STRICT candidate (meets the direction rule)
+    best_strict = None      # tuple sort key + payload
+    # best NEAREST candidate (ignores the direction rule; used only if strict fails)
+    best_nearest = None
+
+    def _rank_tuple(diff_to_target, dist_to_spot, strike, optype_for_sort):
+        # For strikes tie-break, keep your original bias:
+        # puts: prefer *lower* strikes first; calls: prefer *higher* strikes first.
+        # That's implemented by sorting StrikePrice ascending for calls (False),
+        # and descending for puts (True) via the 'reverse' sense inside tuple.
+        # Easier: encode a signed strike for deterministic order:
+        signed_strike = strike if optype_for_sort == 'call' else -strike
+        return (diff_to_target, dist_to_spot, signed_strike)
+
+    def consider_window(lower, upper):
+        nonlocal best_strict, best_nearest
+        window = get_strike_window(strikes_all, spot, lower, upper)
+        for K in window:
+            # price via minute walkback
+            px, t_eff = _price_for_iv(
+                tier, date_d, time_str, expiry_ts, K, optype, max_lookback=max_lookback
+            )
+            if px is None:
+                continue
+
+            ref_dt_eff = pd.to_datetime(f"{date_d} {t_eff}")
+            T_eff, _   = calculate_time_to_expiry(expiry_ts, ref_dt_eff)
+            iv_eff     = iv_cached(float(px), float(spot), float(K), T_eff, RF_RATE, optype)
+            d_eff      = delta_cached(float(spot), float(K), T_eff, RF_RATE, iv_eff, optype)
+            if d_eff is None:
+                continue
+
+            abs_d   = abs(d_eff)
+            tgt_abs = abs(target_delta)
+            ok_strict = (abs_d >= tgt_abs) if direction == '>=' else (abs_d <= tgt_abs)
+
+            diff = abs(abs_d - tgt_abs)
+            dist = abs(float(K) - float(spot))
+            key  = _rank_tuple(diff, dist, float(K), optype)
+
+            cand = {
+                'StrikePrice': float(K),
+                'ExpiryDate' : expiry_ts,
+                'Price'      : float(px),   # same back-filled price as entry
+                'Delta'      : float(d_eff),
+                't_eff'      : t_eff
+            }
+
+            if ok_strict:
+                if (best_strict is None) or (key < best_strict[0]):
+                    best_strict = (key, cand)
+            else:
+                # Track nearest for potential tolerance fallback
+                if (best_nearest is None) or (key < best_nearest[0]):
+                    best_nearest = (key, cand)
+
+    # try base window, then extend
+    for extra in range(0, max_extra + 1):
+        if prefer_below_first:
+            consider_window(base_lower + extra, base_upper)
+            if best_strict is not None:
+                break
+            if extra > 0:
+                consider_window(base_lower, base_upper + extra)
+                if best_strict is not None:
+                    break
+        else:
+            consider_window(base_lower, base_upper + extra)
+            if best_strict is not None:
+                break
+            if extra > 0:
+                consider_window(base_lower + extra, base_upper)
+                if best_strict is not None:
+                    break
+
+    # 1) return strict match if found
+    if best_strict is not None:
+        return best_strict[1]
+
+    # 2) strict failed → nearest-|Δ| fallback IF within tolerance
+    if tolerance and best_nearest is not None:
+        nearest_diff = best_nearest[0][0]  # diff_to_target is the first element
+        if nearest_diff <= abs(float(tolerance)):
+            out = dict(best_nearest[1])
+            out['relaxed_pick'] = True
+            out['tolerance']    = float(tolerance)
+            return out
+
+    # 3) still nothing → no match
+    return None
+
+
+
+# ===================== Main engine =====================
+def generate_rhino_strategy(mapped_days, option_data, option_data1, option_data2, index_df,state_in: Optional[EngineState] = None):    # Normalize time strings
+    option_data = normalize_time_column(option_data)
+    option_data1 = normalize_time_column(option_data1)
+    option_data2 = normalize_time_column(option_data2)
+    index_df = normalize_time_column(index_df)
+
+
+    # Ensure Date types
+    for df in [option_data, option_data1, option_data2, index_df, mapped_days]:
+        df['Date'] = pd.to_datetime(df['Date'])
+
+    # ⬇️ load persistent state if present, else start fresh
+    if state_in is not None:
+        open_structs = state_in.open_structs
+        pending_reopen = dict(state_in.pending_reopen)
+        realised_by_pid = defaultdict(float, state_in.realised_by_pid)
+        last_tier_by_sid = dict(state_in.last_tier_by_sid)
+    else:
+        open_structs = []              # was local; now only default for the very first chunk
+        pending_reopen = {}
+        realised_by_pid = defaultdict(float)
+        last_tier_by_sid = {}
+    
+    trades = []
+    prev_loop_date = None
+
+    _logged_day_open, _logged_day_eod = set(), set()
+
+    # Stream these to disk; keep "trades" in memory for lifecycle logic
+    pnl_stream_path  = f"{output_folder_path}/pid_unreal_real_stream_{year}.csv"
+    legs_ts_path     = f"{output_folder_path}/legs_timeseries_{year}.csv"
+    pnl_stream_buf   = RowBuffer(pnl_stream_path, parquet=False, chunk=50_000)
+    legs_timeseries_buf = RowBuffer(legs_ts_path, parquet=False, chunk=50_000)
+
+    
+
+    def log_day_marker(action_dt, tag, vix_reg=None, mdrow=None):
+        """
+        tag: "DAY_OPEN" or "DAY_EOD"
+        vix_reg: "LOW"/"HIGH" if known, else None
+        mdrow: mapped_days row (to show ME/NE/FE in comment)
+        """
+        me = pd.to_datetime(mdrow['MonthlyExpiry']).date()        if mdrow is not None else None
+        ne = pd.to_datetime(mdrow['Next Monthly Expiry']).date()  if mdrow is not None else None
+        fe = pd.to_datetime(mdrow['3rd Monthly Expiry']).date()   if mdrow is not None else None
+        comment = f"ME={me}, NE={ne}, FE={fe}"
+        trades.append({
+            'Date': pd.to_datetime(action_dt).date(),
+            'Time': pd.to_datetime(action_dt).strftime("%H:%M"),
+            'StructureID': "DAY",      # marker rows
+            'Slot': "",
+            'Type': "marker",
+            'Action': tag,             # "DAY_OPEN" or "DAY_EOD"
+            'LegRole': None,
+            'Strike': None,
+            'Delta': None,
+            'DTE': None,
+            'Comment': comment
+        })
+
+    def log(action_dt, pid, slot, stype, action,
+        leg_role=None, strike=None, delta=None, dte=None,
+        comment="", legs_snapshot=None, spot=None, pnl=None, reason=None):
+        row = {
+            'Date': pd.to_datetime(action_dt).date(),
+            'Time': pd.to_datetime(action_dt).strftime("%H:%M"),
+            'StructureID': pid,
+            'Slot': slot,
+            'Type': stype,          # 'rhino' or 'calendar'
+            'Action': action,
+            'LegRole': leg_role,
+            'Spot': spot,
+            'Strike': strike,
+            'Delta': delta,
+            'DTE': dte,
+            'Comment': comment,
+        }
+
+        # Attach per-leg snapshots if provided
+        # Expected keys in legs_snapshot: long1/short/long2/cal_short/cal_long
+        if isinstance(legs_snapshot, dict):
+            ls = legs_snapshot
+
+            def fill_role(prefix, key):
+                if key not in ls:
+                    return
+                snap = ls[key]
+                row[f'{prefix}_Strike'] = snap.get('strike')
+                row[f'{prefix}_Delta']  = snap.get('delta')
+                row[f'{prefix}_Price']  = snap.get('price')
+                row[f'{prefix}_Expiry'] = pd.to_datetime(
+                    snap.get('expiry'), errors='coerce'
+                )
+
+            fill_role('long1', 'long1')
+            fill_role('short', 'short')
+            fill_role('long2', 'long2')
+            fill_role('cal_short', 'cal_short')
+            fill_role('cal_long', 'cal_long')
+
+        # Attach P&L if this is an exit/universal exit row
+        if pnl is not None:
+            row['PnL'] = float(pnl)
+
+        trades.append(row)
+
+    def exlog(ts, pid, slot, reason, extra=""):
+        trades.append({
+            'Date': pd.to_datetime(ts).date(),
+            'Time': pd.to_datetime(ts).strftime("%H:%M"),
+            'StructureID': pid,
+            'Slot': slot,
+            'Type': "exception",
+            'Action': reason,
+            'Comment': extra
+        })
+    # Iterate index minutes
+    # prefilter to 5-min rows once
+    idx5 = index_df[index_df['Time'].str.match(r'^\d{2}:\d{2}$', na=False)]
+    idx5 = idx5[idx5['Time'].str[-2:].isin(['00','05','10','15','20','25','30','35','40','45','50','55'])]
+    trading_dates = set(index_df['Date'].dt.date.unique())
+
+    for irow in idx5.itertuples(index=False):
+        date = pd.to_datetime(irow.Date).date()
+        time_str = irow.Time
+
+        # day change → clear caches once
+        if (prev_loop_date is None) or (date != prev_loop_date):
+            _clear_snapshot_caches()
+            _clear_strike_list_cache()
+            try:
+                iv_cached.cache_clear()
+                delta_cached.cache_clear()
+            except Exception:
+                pass
+            prev_loop_date = date
+
+        spot = float(irow.Spot)
+        if not np.isfinite(spot):
+            continue
+
+
+        ref_dt = pd.to_datetime(f"{date} {time_str}")
+       
+        # Map row for this date
+        mdrow = mapped_days[mapped_days['Date'].dt.date == date]
+        if mdrow.empty:
+            continue
+        mdrow = mdrow.iloc[0]
+
+       
+        # --- Day markers (logged once per date) ---
+        if (time_str == DAY_OPEN_TIME) and (date not in _logged_day_open):
+            log_day_marker(pd.to_datetime(f"{date} {time_str}"), "DAY_OPEN",    mdrow=mdrow)
+            _logged_day_open.add(date)
+            # 👇 add this
+            print(f"▶️ Processing {date} ...")
+
+        if (time_str == DAY_EOD_TIME) and (date not in _logged_day_eod):
+            log_day_marker(pd.to_datetime(f"{date} {time_str}"), "DAY_EOD",    mdrow=mdrow)
+            _logged_day_eod.add(date)
+            # Opportunistic flush so you see day’s logs on disk immediately
+            try:
+                if 'legs_timeseries_buf' in locals():
+                    legs_timeseries_buf.flush()
+                if 'pnl_stream_buf' in locals():
+                    pnl_stream_buf.flush()
+            except Exception as _e:
+                log_time(f"[day flush] {date} failed: {_e}")
+            print(f"✅ {date} done.")
+
+        
+        # - ------- Universal Exit with 15:00 timing --------
+        for st in list(open_structs):
+            _, tier = resolve_chain_for_expiry(
+                date, mdrow, st.expiry, option_data, option_data1, option_data2
+            )
+
+            # --- tier-shift debug (st exists here) ---
+            prev = last_tier_by_sid.get(st.sid)
+            if prev != tier:
+                dbg("TIER_SHIFT", sid=st.sid, pid=st.pid, old=prev, new=tier, date=str(date), time=time_str)
+                last_tier_by_sid[st.sid] = tier
+            # -----------------------------------------
+
+            _T, DTE = calculate_time_to_expiry(st.expiry, ref_dt)
+
+            # On the day it becomes 15, exit at 15:00 or later.
+            def ue_due(dte, tstr):
+                if dte < UNIVERSAL_EXIT_DTE:
+                    return True
+                if dte == UNIVERSAL_EXIT_DTE and tstr >= "15:00":
+                    return True
+                return False
+
+            if not ue_due(DTE, time_str):
+                continue
+            
+            snap = {}
+            roles = _roles_for_type(st.stype)
+            for role in roles:
+                lg = next((x for x in st.legs if x.role == role), None)
+                if lg is None:
+                    continue
+
+                _, tier_ue = resolve_chain_for_expiry_cached(
+                    date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                )
+
+                # strict back-fill for THIS instrument; use SAME price for IV/Δ and PnL
+                price, t_eff = _price_for_iv(
+                    tier_ue, date, time_str, lg.expiry, lg.strike, lg.kind, max_lookback=300
+                )
+                if price is None:
+                    continue
+                    
+                    
+                T_eff, _ = calculate_time_to_expiry(lg.expiry, pd.to_datetime(f"{date} {t_eff}"))
+                iv_eff = iv_cached(price, spot, lg.strike, T_eff, RF_RATE, lg.kind)
+                d_eff  = delta_cached(spot, lg.strike, T_eff, RF_RATE, iv_eff, lg.kind)
+
+                snap[role] = {
+                    'strike': float(lg.strike),
+                    'price': float(price),      # ← SAME price used for exit PnL
+                    'delta': d_eff,
+                    'expiry': lg.expiry.date(),
+                    't_eff': t_eff
+                }
+
+            # compute PnL *after* snap is ready
+            pnl_value = structure_pnl(st, snap)
+            realised_by_pid[st.pid] += float(pnl_value)       # NEW
+
+
+            st.status = "closed"
+
+            # free the slot
+            ensure_group(st.pid)
+            if st.stype == "rhino" and st.slot in ("R1","R2"):
+                position_groups[st.pid][st.slot] = None
+            if st.stype == "calendar" and st.slot == "CAL":
+                position_groups[st.pid]["CAL"] = None
+
+            open_structs.remove(st)
+
+            # single log row with PnL
+            log(ref_dt, st.pid, st.slot, st.stype, "UNIVERSAL_EXIT(<15DTE)",
+                    dte=DTE, comment=f"tier={tier}",
+                legs_snapshot=snap, spot=spot, pnl=pnl_value)
+
+        # Entry: first Monday 09:30 (only if we still can add)
+        if is_first_trading_monday_930(date, time_str, trading_dates):            # Rhino must be entered on NEXT-MONTH expiry (option_data1)
+            next_expiry = pd.to_datetime(mdrow['Next Monthly Expiry'])
+            pid = make_pid(next_expiry)
+            ensure_group(pid)
+
+            if rhino_slots_count(pid) < max_allowed_rhinos():
+                slot = first_free_rhino_slot_env(pid)
+
+                dbg("ENTRY_CHECK",
+                    date=str(date), time=time_str, pid=pid, slot=slot,
+                    chain="option_data1 (next)", next_expiry=str(next_expiry.date()))
+                if slot is not None:
+                    _, tier_next = resolve_chain_for_expiry_cached(
+                        date, mdrow, next_expiry, option_data, option_data1, option_data2
+                    )
+                    chain = get_chain_minute_fast(tier_next, date, time_str, fallback=True, max_lookback=15)
+                    if chain.empty:
+                        exlog(ref_dt, pid, slot, "NO_CHAIN_MINUTE",
+                            "entry: option_data1 (next); time="+time_str)
+                    else:
+                        slice_df = extract_option_chain_slice(chain, spot, 'put')
+                        
+                        # 👇 add this just before selecting legs
+                        _debug_print_candidates(chain, spot, ref_dt)
+
+
+                        if slice_df.empty:
+                            exlog(ref_dt, pid, slot, "NO_STRIKE_WINDOW", f"spot={spot}")
+                        else:
+                            sel1 = pick_leg_by_delta_walkback(
+                                tier_next, date, time_str, next_expiry, spot,
+                                'put', DELTA_TARGETS_RHINO['leg1_long'], '>=',
+                                base_lower=PUT_WIN_BELOW, base_upper=PUT_WIN_ABOVE, max_extra=10, bias='below',max_lookback=10
+                            )
+                            sel2 = pick_leg_by_delta_walkback(
+                                tier_next, date, time_str, next_expiry, spot,
+                                'put', DELTA_TARGETS_RHINO['leg2_short'], '>=',
+                                base_lower=PUT_WIN_BELOW, base_upper=PUT_WIN_ABOVE, max_extra=10, bias='below', max_lookback=10
+                            )
+                            sel3 = pick_long2_by_delta_smart(
+                                tier=tier_next,
+                                date=date,
+                                time_str=time_str,
+                                expiry=next_expiry,
+                                spot=spot,
+                                target_delta=-0.17,
+                                relax_lower=-0.23,        # corridor (−0.21, −0.17)
+                                recent_minutes=10,
+                                max_walkback=30,         # keep large to reach back to 09:15 if needed
+                                rf=RF_RATE
+                            )
+
+
+
+
+
+                            if any(s is None for s in (sel1, sel2, sel3)):
+                                # optional: log which one failed so you can see why no entry happened
+                                exlog(ref_dt, pid, slot, "DELTA_PICK_FAILED",
+                                    f"sel1={sel1 is None}, sel2={sel2 is None}, sel3={sel3 is None}")
+                            else:
+                                sid = f"{pid}-{slot}"
+                                rh = Structure(
+                                    sid=sid, stype="rhino", opened_at=ref_dt, expiry=next_expiry,
+                                    legs=[
+                                        Leg("put","long1", float(sel1['StrikePrice']), pd.to_datetime(sel1['ExpiryDate']),
+                                            RHINO_LONG_LOTS, float(sel1['Price']), +1),
+                                        Leg("put","short", float(sel2['StrikePrice']), pd.to_datetime(sel2['ExpiryDate']),
+                                            RHINO_SHORT_LOTS, float(sel2['Price']), -1),
+                                        Leg("put","long2", float(sel3['StrikePrice']), pd.to_datetime(sel3['ExpiryDate']),
+                                            RHINO_LONG_LOTS, float(sel3['Price']), +1),
+
+                                    ],
+                                    pid=pid, slot=slot
+                                )
+
+                                open_structs.append(rh)
+                                position_groups[pid][slot] = rh.sid
+                                
+                                # recompute per-leg minute-Open snapshots with minute walkback
+                                legs_snap = {}
+                                for lg in rh.legs:   # (or cal.legs)
+                                    _, tier_ent = resolve_chain_for_expiry_cached(
+                                        date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                                    )
+                                    s = build_leg_snapshot_exact(
+                                        tier_ent, date, time_str, lg.expiry, lg.strike, lg.kind, spot,
+                                        max_lookback=30
+                                    )
+                                    if s is not None:
+                                        legs_snap[lg.role] = s
+
+
+                                log(ref_dt, pid, slot, rh.stype, "OPEN",
+                                       
+                                    comment=f"exp={next_expiry.date()}   ",
+                                    legs_snapshot=legs_snap, spot=spot)
+
+                # else: no rows at that minute; skip
+
+        # ============= Monitoring & Adjustments =============
+        # For each open structure, align chain daily and then check conditions.
+        minute_unreal_by_pid = defaultdict(float)
+
+        _reopen_done = False  # ensure we process pending_reopen at most once per minute
+
+        for st in list(open_structs):
+            if st.status != "open":
+                continue
+
+            _, tier = resolve_chain_for_expiry(date, mdrow, st.expiry, option_data, option_data1, option_data2)
+
+            # --- tier-shift debug (st exists here) ---
+            prev = last_tier_by_sid.get(st.sid)
+            if prev != tier:
+                dbg("TIER_SHIFT", sid=st.sid, pid=st.pid, old=prev, new=tier, date=str(date), time=time_str)
+                last_tier_by_sid[st.sid] = tier
+            # -----------------------------------------
+
+            # Minute rows for this st
+            leg_info = {}  # rebuild fresh per structure per minute
+            for lg in st.legs:
+                # Resolve the tier for THIS leg's expiry
+                _, tier_leg = resolve_chain_for_expiry_cached(
+                    date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                )
+
+                # Walk back strictly minute-by-minute for this instrument
+                price, t_eff = _price_for_iv(
+                    tier_leg, date, time_str, lg.expiry, lg.strike, lg.kind, max_lookback=300
+                )
+                if price is None:
+                    continue
+                # Use SAME price for IV/Δ and PnL
+                T, DTE = calculate_time_to_expiry(lg.expiry, ref_dt)
+                iv = iv_cached(price, spot, lg.strike, T, RF_RATE, lg.kind)
+                d  = delta_cached(spot, lg.strike, T, RF_RATE, iv, lg.kind)
+
+                leg_info[lg.role] = {
+                    'price':       float(price),   # ← SAME price used in PnL
+                    'delta':       d,
+                    'dte':         DTE,
+                    'entry_price': float(lg.entry_price),
+                    'lots':        int(lg.lots),
+                    'dir':         int(lg.direction),
+                    'strike':      float(lg.strike),
+                    'expiry':      lg.expiry.date(),
+                    'kind':        lg.kind,
+                    't_eff':       t_eff,          # audit: the minute we back-filled from
+                }
+
+
+
+
+            # ---- DO NOT drop the structure; work with whatever legs we successfully priced ----
+            roles_present = [lg.role for lg in st.legs if lg.role in leg_info]
+
+            # structure MTM (minute) over available legs ONLY (uses SAME back-filled prices)
+            struct_mtm = 0.0
+            for lg in st.legs:
+                if lg.role not in roles_present:
+                    continue
+                px_now = float(leg_info[lg.role]['price'])
+                struct_mtm += (px_now - float(lg.entry_price)) * float(lg.direction) * int(lg.lots) * LOT_SIZE
+
+            # ---------- per-5min legs timeseries logging ----------
+            # (logs only the legs we priced this minute, using the same back-filled price)
+            legs_tiers = {}
+            for lg in st.legs:
+                if lg.role not in roles_present:
+                    continue
+                _, tier_leg = resolve_chain_for_expiry_cached(
+                    date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                )
+                legs_tiers[lg.role] = tier_leg
+
+            for lg in st.legs:
+                if lg.role not in roles_present:
+                    continue
+                info = leg_info[lg.role]
+                leg_mtm = (float(info['price']) - float(lg.entry_price)) * float(lg.direction) * int(lg.lots) * LOT_SIZE
+                legs_timeseries_buf.add({
+                    'Date': date,
+                    'Time': time_str,
+                    'PID': st.pid,
+                    'StructureID': st.sid,
+                    'Slot': st.slot,
+                    'Type': st.stype,
+                    'Spot': float(spot),
+                    'Tier': legs_tiers.get(lg.role, None),
+                    'Role': lg.role,
+                    'Kind': lg.kind,
+                    'Strike': float(lg.strike),
+                    'Expiry': lg.expiry.date(),
+                    'Lots': int(lg.lots),
+                    'Direction': int(lg.direction),
+                    'EntryPrice': float(lg.entry_price),
+                    'Price': float(info['price']),                 # ← SAME back-filled price
+                    'Delta': (None if info['delta'] is None else float(info['delta'])),
+                    'DTE': int(info['dte']),
+                    'LegMTM': float(leg_mtm),
+                    'StructMTM': float(struct_mtm),
+                    'RealisedPnL_PID': float(realised_by_pid.get(st.pid, 0.0)),
+                    'TEff': info.get('t_eff')                     # minute we back-filled from
+                })
+
+            # contribute to per-PID unrealised using the same prices
+            if st.status == "open":
+                mtm_s = 0.0
+                for lg in st.legs:
+                    if lg.role not in roles_present:
+                        continue
+                    px_now = float(leg_info[lg.role]['price'])
+                    mtm_s += (px_now - float(lg.entry_price)) * float(lg.direction) * int(lg.lots) * LOT_SIZE
+                minute_unreal_by_pid[st.pid] += float(mtm_s)
+
+
+            # Universal DTE check already handled above; now regime rules:
+
+            # ---- Calendar independent exit ----
+            if st.stype == "calendar":
+                sd = (leg_info.get("cal_short") or {}).get("delta", None)
+                cond_up = (sd is not None) and (sd >= 0.50)
+                cond_dn = (sd is not None) and (sd <= 0.30)
+
+                key = "CAL_EXIT"
+
+                if cond_up or cond_dn:
+                    st.bump_counter(key)
+                    if st.reached_persist(key):
+                        # Try to snapshot current leg strikes + live deltas (using current minute price with fallbacks) — CACHED
+                        snap = {}
+                        for role in ("cal_short", "cal_long"):
+                            lg = next((x for x in st.legs if x.role == role), None)
+                            if lg is None:
+                                continue
+
+                            _, tier_cal = resolve_chain_for_expiry_cached(
+                                date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                            )
+
+                            price, t_eff = _price_for_iv(
+                                tier_cal, date, time_str, lg.expiry, lg.strike, lg.kind, max_lookback=300
+                            )
+                            if price is None:
+                                continue    
+                            T_eff, _ = calculate_time_to_expiry(lg.expiry, pd.to_datetime(f"{date} {t_eff}"))
+                            iv_eff = iv_cached(price, spot, lg.strike, T_eff, RF_RATE, lg.kind)
+                            d_eff  = delta_cached(spot, lg.strike, T_eff, RF_RATE, iv_eff, lg.kind)
+
+                            snap[role] = {
+                                'strike': float(lg.strike),
+                                'price': float(price),      # ← SAME price used for exit PnL
+                                'delta': d_eff,
+                                'expiry': lg.expiry.date(),
+                                't_eff': t_eff
+                            }
+
+
+                        # compute P&L after we have both legs
+                        pnl_value = structure_pnl(st, snap)
+                        realised_by_pid[st.pid] += float(pnl_value)       # NEW
+
+
+                        # mark closed + free CAL slot
+                        st.status = "closed"
+                        ensure_group(st.pid)
+                        position_groups[st.pid]["CAL"] = None
+                        open_structs.remove(st)
+
+                        # log one EXIT row with details
+                        cal_short_strike = next((x.strike for x in st.legs if x.role == "cal_short"), None)
+                        reason_txt = "cal_short Δ>=0.50" if cond_up else "cal_short Δ<=0.30"
+                        log(
+                            ref_dt, st.pid, st.slot, st.stype,
+                            "EXIT(cal_short delta outside [0.30,0.50])", "cal_short",
+                            strike=cal_short_strike,
+                            delta=float(sd) if sd is not None else None,
+                               
+                            dte=(leg_info.get("cal_short") or {}).get("dte"),
+                            comment=f"tier={tier}; reason={reason_txt}",
+                            legs_snapshot=snap,
+                            spot=spot,
+                            pnl=pnl_value,
+                            reason="CAL_EXIT"
+                        )
+                        continue
+                else:
+                    st.reset_counter(key)
+
+                # skip other rhino logic for calendars
+                continue
+
+                
+
+            # Helper to add another Rhino (if <2)
+            def try_add_rhino(target_expiry=None, trigger_reason=None):
+                nonlocal date, time_str, mdrow, spot, ref_dt
+
+                if target_expiry is None:
+                    target_expiry = pd.to_datetime(mdrow['Next Monthly Expiry'])
+
+                pid = make_pid(target_expiry)
+                ensure_group(pid)
+
+                # hard cap: max 2 rhinos per PID
+                if rhino_slots_count(pid) >= MAX_RHINOS_PER_PID:
+                    exlog(ref_dt, pid, None, "RHINO_CAP_REACHED",
+                        f"curr={rhino_slots_count(pid)}, max={MAX_RHINOS_PER_PID}")
+                    return False
+
+                slot = first_free_rhino_slot_env(pid)
+                if slot is None:
+                    exlog(ref_dt, pid, None, "NO_FREE_SLOT_ENV", "blocks additional rhino")
+                    return False
+
+                chain_all, tier = resolve_chain_for_expiry(
+                    date, mdrow, target_expiry, option_data, option_data1, option_data2
+                )
+
+                day_slice = chain_all[chain_all['Date'].dt.date == date]
+                if day_slice.empty:
+                    exlog(ref_dt, pid, slot, "NO_DAY_DATA", f"tier={tier}")
+                    return False
+
+                chain = day_slice[day_slice['Time'] == time_str].copy()
+                if chain.empty:
+                    le = day_slice[day_slice['Time'] <= time_str].sort_values('Time')
+                    if not le.empty:
+                        fb_time = le.iloc[-1]['Time']
+                    else:
+                        ge = day_slice.sort_values('Time')
+                        if ge.empty:
+                            exlog(ref_dt, pid, slot, "NO_CHAIN_MINUTE", f"tier={tier} time={time_str}")
+                            return False
+                        fb_time = ge.iloc[0]['Time']
+                    chain = day_slice[day_slice['Time'] == fb_time].copy()
+
+                _debug_print_candidates(chain, spot, ref_dt)
+
+                slice_df = extract_option_chain_slice(chain, spot, 'put')
+                if slice_df.empty:
+                    exlog(ref_dt, pid, slot, "NO_STRIKE_WINDOW", f"spot={spot}")
+                    return False
+
+                sel1 = pick_leg_by_delta_walkback(
+                    tier, date, time_str, target_expiry, spot,
+                    'put', DELTA_TARGETS_RHINO['leg1_long'], '>=',
+                    base_lower=PUT_WIN_BELOW, base_upper=PUT_WIN_ABOVE,
+                    max_extra=10, bias='below', max_lookback=10
+                )
+                sel2 = pick_leg_by_delta_walkback(
+                    tier, date, time_str, target_expiry, spot,
+                    'put', DELTA_TARGETS_RHINO['leg2_short'], '>=',
+                    base_lower=PUT_WIN_BELOW, base_upper=PUT_WIN_ABOVE,
+                    max_extra=10, bias='below', max_lookback=10
+                )
+                sel3 = pick_long2_by_delta_smart(
+                    tier=tier,
+                    date=date,
+                    time_str=time_str,
+                    expiry=target_expiry,
+                    spot=spot,
+                    target_delta=-0.17,
+                    relax_lower=-0.23,
+                    recent_minutes=10,
+                    max_walkback=30,
+                    rf=RF_RATE
+                )
+
+                if any(s is None for s in (sel1, sel2, sel3)):
+                    exlog(ref_dt, pid, slot, "DELTA_PICK_FAILED",
+                        f"sel1={sel1 is None}, sel2={sel2 is None}, sel3={sel3 is None}")
+                    return False
+
+                sid = f"{pid}-{slot}"
+                rh = Structure(
+                    sid=sid, stype="rhino", opened_at=ref_dt, expiry=pd.to_datetime(target_expiry),
+                    legs=[
+                        Leg("put","long1", float(sel1['StrikePrice']), pd.to_datetime(sel1['ExpiryDate']),
+                            RHINO_LONG_LOTS, float(sel1['Price']), +1),
+                        Leg("put","short", float(sel2['StrikePrice']), pd.to_datetime(sel2['ExpiryDate']),
+                            RHINO_SHORT_LOTS, float(sel2['Price']), -1),
+                        Leg("put","long2", float(sel3['StrikePrice']), pd.to_datetime(sel3['ExpiryDate']),
+                            RHINO_LONG_LOTS, float(sel3['Price']), +1),
+                    ],
+                    pid=pid, slot=slot
+                )
+                open_structs.append(rh)
+                position_groups[pid][slot] = rh.sid
+
+                legs_snap = {}
+                for lg in rh.legs:
+                    _, tier_ent = resolve_chain_for_expiry_cached(
+                        date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                    )
+                    s = build_leg_snapshot_exact(
+                        tier_ent, date, time_str, lg.expiry, lg.strike, lg.kind, spot,
+                        max_lookback=30
+                    )
+                    if s is not None:
+                        legs_snap[lg.role] = s
+
+                log(ref_dt, pid, slot, rh.stype, "OPEN",
+                    comment=f"tier={tier}, exp={pd.to_datetime(target_expiry).date()}",
+                    legs_snapshot=legs_snap, spot=spot)
+                return True
+
+
+            def try_add_calendar(trigger_reason=None):
+                pid = make_pid(st.expiry)  # calendar belongs to SAME expiry as the rhino it hedges
+                ensure_group(pid)
+
+                # ⛔ new guard: calendar only if a Rhino is active in this PID
+                if count_open_rhinos_for_pid(open_structs, pid) == 0:
+                    exlog(ref_dt, pid, "CAL", "BLOCKED_CAL_NO_RHINO_IN_PID",
+                        "Calendar requires at least one active Rhino in PID")
+                    return False
+                
+                # ENV cap guard
+                if calendar_count(pid) >= max_allowed_calendars():
+                    exlog(ref_dt, pid, "CAL", "ENV_CAP_CAL",
+                        f"   , curr={calendar_count(pid)}, max={max_allowed_calendars()}")
+                    return False
+
+                if calendar_exists(pid):
+                    exlog(ref_dt, pid, "CAL", "CAL_EXISTS", "calendar already open")
+
+                    return False
+                
+
+                same_exp = st.expiry
+                next_exp = (pd.to_datetime(mdrow['Next Monthly Expiry'])
+                            if same_exp.date() == pd.to_datetime(mdrow['MonthlyExpiry']).date()
+                            else pd.to_datetime(mdrow['3rd Monthly Expiry']))
+
+                # figure out which tiers the two calendar legs should read from
+                _, tier_same = resolve_chain_for_expiry(date, mdrow, same_exp, option_data, option_data1, option_data2)
+                _, tier_next = resolve_chain_for_expiry(date, mdrow, next_exp, option_data, option_data1, option_data2)
+
+                ch_same = get_chain_minute_fast(tier_same, date, time_str, fallback=True, max_lookback=15)
+                ch_next = get_chain_minute_fast(tier_next, date, time_str, fallback=True, max_lookback=15)
+                
+                if ch_same.empty:
+                    exlog(ref_dt, pid, "CAL", "NO_CHAIN_CAL_SAME", f"time={time_str}")
+                    return False
+                if ch_next.empty:
+                    exlog(ref_dt, pid, "CAL", "NO_CHAIN_CAL_NEXT", f"time={time_str}")
+                    return False
+                
+                sl1 = pick_leg_by_delta_walkback(
+                    tier_same, date, time_str, same_exp, spot,
+                    'call', DELTA_TARGET_CAL, '<=',
+                    base_lower=CALL_WIN_BELOW, base_upper=CALL_WIN_ABOVE, max_extra=10, bias='above',max_lookback=10
+                )
+                sl2 = pick_leg_by_delta_walkback(
+                    tier_next, date, time_str, next_exp, spot,
+                    'call', DELTA_TARGET_CAL, '<=',
+                    base_lower=CALL_WIN_BELOW, base_upper=CALL_WIN_ABOVE, max_extra=10, bias='above',max_lookback=10
+                )
+
+                if sl1 is None:
+                    exlog(ref_dt, pid, "CAL", "NO_DELTA_MATCH_CAL_short", "|Δ|<=0.40 not found (same exp)")
+                    return False
+                if sl2 is None:
+                    exlog(ref_dt, pid, "CAL", "NO_DELTA_MATCH_CAL_long", "|Δ|<=0.40 not found (next exp)")
+                    return False
+
+                sid = f"{pid}-CAL"
+                cal = Structure(
+                    sid=sid, stype="calendar", opened_at=ref_dt, expiry=same_exp,
+                    legs=[
+                        Leg("call","cal_short", float(sl1['StrikePrice']), pd.to_datetime(sl1['ExpiryDate']),
+                            CALENDAR_LOTS, float(sl1['Price']), -1),
+                        Leg("call","cal_long",  float(sl2['StrikePrice']), pd.to_datetime(sl2['ExpiryDate']),
+                            CALENDAR_LOTS, float(sl2['Price']), +1),
+                    ],
+                    pid=pid, slot="CAL"
+                )
+                open_structs.append(cal)
+                position_groups[pid]["CAL"] = cal.sid
+
+                # recompute per-leg minute-Open snapshots with minute walkback
+                legs_snap = {}
+                for lg in cal.legs:
+                    _, tier_ent = resolve_chain_for_expiry_cached(
+                        date, mdrow, lg.expiry, option_data, option_data1, option_data2
+                    )
+                    s = build_leg_snapshot_exact(
+                        tier_ent, date, time_str, lg.expiry, lg.strike, lg.kind, spot,
+                        max_lookback=30
+                    )
+                    if s is not None:
+                        legs_snap[lg.role] = s
+
+                log(ref_dt, pid, "CAL", cal.stype, "OPEN",    
+                    comment=f"Calendar added; same_exp={same_exp.date()}, next_exp={next_exp.date()}   ",
+                    legs_snapshot=legs_snap,reason=trigger_reason)
+                return True
+
+            # ---- reattempt any pending re-opens (do this once per minute, after try_add_rhino exists) ----
+            if (not _reopen_done) and pending_reopen:
+                for pid, info in list(pending_reopen.items()):
+                    tgt = pd.to_datetime(info['target_expiry'])
+                    _T, _dte = calculate_time_to_expiry(tgt, ref_dt)
+                    # if already at/below 15 DTE and it's 15:00 or later, give up on re-open
+                    if _dte < UNIVERSAL_EXIT_DTE or (_dte == UNIVERSAL_EXIT_DTE and time_str >= "15:00"):
+                        pending_reopen.pop(pid, None)
+                        continue
+                    pid_re = make_pid(tgt)
+                    
+
+                    ok = try_add_rhino(target_expiry=tgt)
+                    if ok:
+                        pending_reopen.pop(pid, None)
+                _reopen_done = True
+
+            # ---- Rhino regime-based conditions ----
+            short_delta = (leg_info.get("short") or {}).get("delta", None)
+            long_delta  = (leg_info.get("long1") or {}).get("delta", None)
+            if short_delta is None and long_delta is None:
+                continue
+
+
+            # condition keys
+            k_sd_45_add   = "SD<=-0.45_ADD"
+            k_sd_52_exit  = "SD<=-0.52_EXIT"
+            k_ld_45_add   = "LD>=-0.45_ADD"
+            k_ld_40_reset = "LD>=-0.40_RESET"   # universal exit
+
+            # Evaluate once
+            cond_sd_45 = (short_delta is not None) and (short_delta <= -0.45)
+            cond_sd_52 = (short_delta is not None) and (short_delta <= -0.52)
+            cond_ld_45 = (long_delta  is not None)  and (long_delta  >= -0.45)
+            cond_ld_40 = (long_delta  is not None)  and (long_delta  >= -0.40)
+
+            # --- Short-delta rules (same as before) ---
+            if cond_sd_45:
+                st.bump_counter(k_sd_45_add)
+                if st.reached_persist(k_sd_45_add):
+                    pid_here = st.pid
+                    if rhino_slots_count(st.pid) == 1:
+                        try_add_rhino(target_expiry=st.expiry,trigger_reason="Added_rhino_from_SD<=-0.45")
+            else:
+                st.reset_counter(k_sd_45_add)
+
+            if cond_sd_52:
+                st.bump_counter(k_sd_52_exit)
+                if st.reached_persist(k_sd_52_exit):
+                    # snapshot + exit + reopen same-expiry
+                    snap = _snapshot_exit_backfilled(
+                        date, time_str, st, mdrow,
+                        option_data, option_data1, option_data2,
+                        spot
+                    )
+
+                    pnl_value = structure_pnl(st, snap)
+                    realised_by_pid[st.pid] += float(pnl_value)       # NEW
+
+                    st.status = "closed"
+                    short_strike = next((x.strike for x in st.legs if x.role == "short"), None)
+
+                    log(ref_dt, st.pid, st.slot, st.stype, "EXIT(delta_short<=-0.52)", "short",
+                        strike=short_strike, delta=float(leg_info["short"]["delta"]),
+                            dte=(leg_info.get("short") or {}).get("dte"),
+                        comment=f"tier={tier}", legs_snapshot=snap, spot=spot, pnl=pnl_value)
+
+                    ensure_group(st.pid)
+                    if st.slot in ("R1", "R2"):
+                        position_groups[st.pid][st.slot] = None
+                    open_structs.remove(st)
+
+                    # No immediate re-entry on SD<=-0.52 in LOW-vol.
+                    # Wait for the next valid entry/add trigger (LD>=-0.45, 09:30 Monday, etc.).
+                    # So we intentionally do nothing here (no pending_reopen either).
+                    continue
+            else:
+                st.reset_counter(k_sd_52_exit)
+
+            # --- Long-delta -0.45 first (ADD/Calendar), THEN -0.40 universal exit ---
+            if cond_ld_45:
+                st.bump_counter(k_ld_45_add)
+                if st.reached_persist(k_ld_45_add):
+                    log(ref_dt, st.pid, st.slot, st.stype,
+                        "TRIGGER(LD>=-0.45)",
+                        leg_role="long1",
+                        delta=(leg_info.get("long1") or {}).get("delta"),
+                            
+                        dte=(leg_info.get("long1") or {}).get("dte"),
+                        reason="LD>=-0.45_persisted")
+
+                    _Ttmp, DTE_long = calculate_time_to_expiry(st.expiry, ref_dt)
+                    if rhino_slots_count(st.pid) < 2:
+                        if DTE_long < 25:
+                            try_add_calendar(trigger_reason="CAL_from_DTE<25")
+                        else:
+                            try_add_rhino(target_expiry=st.expiry,trigger_reason='Added_rhino_from_LD>=-0.45')
+            else:
+                st.reset_counter(k_ld_45_add)
+
+            if cond_ld_40:
+                st.bump_counter(k_ld_40_reset)
+                if st.reached_persist(k_ld_40_reset):
+                    # snapshot + exit + reopen same-expiry
+                    snap = _snapshot_exit_backfilled(
+                        date, time_str, st, mdrow,
+                        option_data, option_data1, option_data2,
+                        spot
+                    )
+
+                    pre_exit_count = rhino_slots_count(st.pid)
+                    st.status = "closed"
+                    pnl_value = structure_pnl(st, snap)
+                    realised_by_pid[st.pid] += float(pnl_value)       # NEW
+
+                    long1_strike = next((x.strike for x in st.legs if x.role=="long1"), None)
+
+                    log(ref_dt, st.pid, st.slot, st.stype, "EXIT(delta_long>=-0.40)", "long1",
+                        strike=long1_strike, delta=(leg_info.get("long1") or {}).get("delta"),
+                            dte=(leg_info.get("long1") or {}).get("dte"),
+                        comment=f"tier={tier}", legs_snapshot=snap, spot=spot, pnl=pnl_value)
+
+                    ensure_group(st.pid)
+                    if st.slot in ("R1","R2"):
+                        position_groups[st.pid][st.slot] = None
+                    open_structs.remove(st)
+                    # if there were already 2 rhinos, DO NOT re-enter (and don't queue pending)
+                    if pre_exit_count >= 2:
+                        continue
+
+                    # therwise keep your current behavior (re-enter same expiry; queue pending if needed)
+                    ok = try_add_rhino(target_expiry=st.expiry)
+                    if not ok:
+                        pending_reopen[make_pid(st.expiry)] = {'target_expiry': st.expiry}
+                    continue
+            else:
+                st.reset_counter(k_ld_40_reset)
+
+        # NEW — after finishing the for-st loop for this minute, flush per-PID rows
+        if 'minute_unreal_by_pid' in locals():
+            for pid_unr, unr_val in minute_unreal_by_pid.items():
+                real_val = realised_by_pid[pid_unr]  # running realised
+                pnl_stream_buf.add({
+                    'PID': pid_unr,
+                    'Date': date,
+                    'Time': time_str,
+                    'UnrealisedPnL': float(unr_val),
+                    'RealisedPnL': float(real_val),
+                    'NetPnL': float(unr_val + real_val),
+                })
+            # reset for next minute
+            del minute_unreal_by_pid
+
+
+    # --- End of main loop over index minutes ---
+    # Final trades DataFrame
+    out = pd.DataFrame(trades)
+    if not out.empty:
+        num_cols = [
+            'long1_Strike','long1_Delta','long1_Price',
+            'short_Strike','short_Delta','short_Price',
+            'long2_Strike','long2_Delta','long2_Price',
+            'cal_short_Strike','cal_short_Delta','cal_short_Price',
+            'cal_long_Strike','cal_long_Delta','cal_long_Price',
+        ]
+        expiry_cols = [
+            'long1_Expiry','short_Expiry','long2_Expiry',
+            'cal_short_Expiry','cal_long_Expiry',
+        ]
+
+        for c in num_cols:
+            if c not in out.columns:
+                out[c] = np.nan
+
+        for c in expiry_cols:
+            if c not in out.columns:
+                out[c] = pd.NaT
+            out[c] = pd.to_datetime(out[c], errors='coerce')
+
+        
+    try:
+        legs_timeseries_buf.close()
+        pnl_stream_buf.close()
+    except Exception as e:
+        log_time(f"[buffers close] {e}")
+
+    # just before the return:
+    state_out = EngineState(
+        open_structs=open_structs,
+        pending_reopen=pending_reopen,
+        realised_by_pid=dict(realised_by_pid),
+        last_tier_by_sid=last_tier_by_sid
+    )
+
+    return out,state_out
+
+if __name__ == "__main__":
+    t0_total = perf_counter()
+    counter = 0
+    all_results = []
+    all_option_data  = []
+    all_option_data1 = []
+    all_option_data2 = []
+    timing_rows = []   # <-- collect structured timing rows
+    engine_state = None
+    log_time("🚀 Starting Rhino backtest")
+
+    DELTA_POOL = None  
+
+    # try:
+    #     nproc = min(4, (cpu_count() or 4))
+    # except Exception:
+    #     nproc = 4
+    # DELTA_POOL = Pool(processes=nproc)
+    # log_time(f"⚙️  Multiprocessing pool started with {nproc} workers")
+
+    # ---- Date bounds from your ranges ----
+    start_date_idx = date_ranges[0][0]
+    end_date_idx   = date_ranges[-1][1]
+
+    # 📄 Read expiry mapping (once)
+    mapped_days = pd.read_excel(expiry_file_path)
+
+    # Core parsing
+    mapped_days['Date']                 = pd.to_datetime(mapped_days['Date'], errors='coerce')
+    mapped_days['MonthlyExpiry']        = pd.to_datetime(mapped_days['MonthlyExpiry'], errors='coerce')
+    mapped_days['Next Monthly Expiry']  = pd.to_datetime(mapped_days['Next Monthly Expiry'], errors='coerce')
+    mapped_days['3rd Monthly Expiry']   = pd.to_datetime(mapped_days['3rd Monthly Expiry'], errors='coerce')
+
+    # Optional DaysToExpiry precompute
+    if 'DaysToExpiry' not in mapped_days.columns:
+        mapped_days['DaysToExpiry'] = (
+            mapped_days['MonthlyExpiry'].dt.normalize() - mapped_days['Date'].dt.normalize()
+        ).dt.days.clip(lower=0)
+
+    mapped_days['Day'] = mapped_days['Date'].dt.day_name()
+    mapped_days = mapped_days.loc[:, ~mapped_days.columns.duplicated()].copy()
+
+    # ✅ Global date filter for mapped_days (outer bounds + specific exclusions)
+    mapped_days = mapped_days[
+        (mapped_days['Date'] >= pd.to_datetime(start_date_idx)) &
+        (mapped_days['Date'] <= pd.to_datetime(end_date_idx)) &
+        (mapped_days['Date'] != pd.Timestamp('2024-05-18')) &
+        (mapped_days['Date'] != pd.Timestamp('2024-05-20'))
+    ].copy()
+
+    if mapped_days.empty:
+        log_time("⚠️ No mapped days in the overall window. Nothing to do.")
+        raise SystemExit(0)
+
+    # 📊 Load index data once for the outer window
+    df = pull_index_data(start_date_idx, end_date_idx, stock, mapped_days).copy()
+    # Build Date/Time/Spot as required by strategy
+    df['Date'] = pd.to_datetime(df.index.date)
+    df['Time'] = pd.to_datetime(df.index).strftime('%H:%M')
+    df['Spot'] = df['Open']
+    # Ensure strategy-friendly Time normalization
+    df = normalize_time_column(df)
+
+    # 📉 Load VIX regime once (full history; the strategy picks per-day rows)
+    
+    print("mapped_days['Date'] dtype:", mapped_days['Date'].dtype)
+    print("index_data['Date'] dtype:", df['Date'].dtype)
+
+    # 📈 Iterate over each backtest sub-range
+    for start_date, end_date in date_ranges:
+        t0_range = perf_counter()
+        counter += 1
+        print(f"\n📅 Range {counter}: {start_date} → {end_date}")
+        _clear_snapshot_caches()
+        _clear_strike_list_cache()
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt   = pd.to_datetime(end_date)
+
+        # extend option fetch horizon (for far/next legs, rolls, etc.)
+        extended_end_date = end_dt + timedelta(days=60)
+        extended_end_date_str = extended_end_date.strftime("%Y-%m-%d")
+
+        # Slice mapped_days + index for this sub-range
+        md_slice = mapped_days[(mapped_days['Date'] >= start_dt) & (mapped_days['Date'] <= end_dt)].copy()
+        if md_slice.empty:
+            log_time("⚠️ No mapped days in this range. Skipping.")
+            continue
+
+        idx_slice = df[(df['Date'] >= start_dt) & (df['Date'] <= end_dt)].copy()
+        if idx_slice.empty:
+            log_time("⚠️ No index rows in this range. Skipping.")
+            continue
+
+        # 🔃 Pull options data for this sub-range (with extended tail)
+        t0_pull = perf_counter()
+        use_cols = ['Date','Time','ExpiryDate','StrikePrice','Type','Open']
+
+        option_data  = pull_options_data_d(start_date, extended_end_date_str, option_data_path,  stock)
+        option_data1 = pull_options_data_d(start_date, extended_end_date_str, option_data_path1, stock)
+        option_data2 = pull_options_data_d(start_date, extended_end_date_str, option_data_path2, stock)
+
+        # ↓↓ HARD column trim to avoid RAM blow-ups (Ticker, OI, High/Low/Close are dropped)
+        option_data  = option_data.loc[:,  [c for c in use_cols if c in option_data.columns]]
+        option_data1 = option_data1.loc[:, [c for c in use_cols if c in option_data1.columns]]
+        option_data2 = option_data2.loc[:, [c for c in use_cols if c in option_data2.columns]]
+
+        dt_pull = perf_counter() - t0_pull
+        log_time(f"⏱ Options pulled in {dt_pull:.3f}s")
+        timing_rows.append({
+            "phase": "pull_options", "range_idx": counter,
+            "start_date": start_date, "end_date": end_date, "minutes": _min(dt_pull)
+        })
+
+        # Normalize Time columns for strategy matching
+        option_data  = normalize_time_column(option_data)
+        option_data1 = normalize_time_column(option_data1)
+        option_data2 = normalize_time_column(option_data2)
+        print("Normalized Time columns in option data.")
+
+        option_data  = normalize_option_df(option_data)
+        option_data1 = normalize_option_df(option_data1)
+        option_data2 = normalize_option_df(option_data2)
+        print("Normalized Option DataFrames.")
+        
+        OPTION_DF_MONTHLY, MIN_IDX_MONTHLY = _build_minute_index_positions(option_data)
+        OPTION_DF_NEXT,    MIN_IDX_NEXT    = _build_minute_index_positions(option_data1)
+        OPTION_DF_FAR,     MIN_IDX_FAR     = _build_minute_index_positions(option_data2)
+        
+        # all_option_data.append(option_data)
+        # all_option_data1.append(option_data1)
+        # all_option_data2.append(option_data2)
+
+        # 🚀 Run strategy for this range
+        t0_strat = perf_counter()
+        summary_df, engine_state = generate_rhino_strategy(
+            mapped_days=md_slice,
+            option_data=option_data,
+            option_data1=option_data1,
+            option_data2=option_data2,
+            index_df=idx_slice,
+            state_in=engine_state,                # ⬅️ pass previous state
+        )
+        dt_strat = perf_counter() - t0_strat
+        log_time(f"⏱ generate_rhino_strategy in {dt_strat:.3f}s")
+        timing_rows.append({
+            "phase": "run_strategy", "range_idx": counter,
+            "start_date": start_date, "end_date": end_date, "minutes": _min(dt_strat)
+        })
+
+        if summary_df is not None and not summary_df.empty:
+            all_results.append(summary_df)
+            print(f"✅ Summary rows added: {len(summary_df)}")
+        else:
+            print("❌ No trades/adjustments generated for this range.")
+
+        dt_range_total = perf_counter() - t0_range
+        log_time(f"⏱ Range {counter} total: {dt_range_total:.3f}s")
+        timing_rows.append({
+            "phase": "range_total", "range_idx": counter,
+            "start_date": start_date, "end_date": end_date, "minutes": _min(dt_range_total)
+        })
+
+    # 📁 Save Final Results (once after all ranges)
+    if all_results:
+        final_df = pd.concat(all_results, ignore_index=True)
+        
+        # --- Rebuild FILLS etc. off the final_df ---
+        final_df_sorted = sort_by_date_time_pid(final_df)  # you already do this later; safe to reuse here
+        fills_df = final_df_sorted[
+            final_df_sorted['Type'].isin(['rhino','calendar']) &
+            final_df_sorted['Action'].fillna('').str.startswith(('OPEN','EXIT','UNIVERSAL_EXIT','LEG_EXIT'))
+        ].copy()
+
+        combined_lifecycle = build_lifecycle_from_summary(fills_df)
+
+        combined_lifecycle_sorted = sort_by_date_time_pid(combined_lifecycle)        
+        exceptions = final_df[final_df['Type']=='exception'].copy()
+
+        
+        summary_df_sorted = summary_df.sort_values(['Date','Time'], kind='mergesort').reset_index(drop=True)
+        lifecycle = build_lifecycle_from_summary(summary_df_sorted)
+        # compute total runtime first
+        t1_total = perf_counter()
+        total_sec = t1_total - t0_total
+        log_time(f"⏱ Total runtime: {total_sec:.2f}s")
+        timing_rows.append({
+            "phase": "total_runtime", "range_idx": None,
+            "start_date": date_ranges[0][0], "end_date": date_ranges[-1][1],
+            "minutes": _min(total_sec)
+        })
+        
+        # --- Save everything ---
+        t0_save = perf_counter()
+        output_base = f"{output_folder_path}/rhino_trades_summary_{year}_2"
+        final_df_sorted            = sort_by_date_time_pid(final_df)
+        exceptions_sorted          = sort_by_date_time_pid(exceptions)
+
+        final_df_sorted.to_csv(output_base + ".csv", index=False)
+        exceptions_sorted.to_csv(output_base + "_exceptions.csv", index=False)
+
+        lifecycle.to_csv(output_base + "_lifecycle_per_leg.csv", index=False)
+
+        
+        dt_save = perf_counter() - t0_save
+        log_time(f"\n✅ All summaries saved to: {output_base}*.csv")
+        log_time(f"⏱ Save phase in {dt_save:.3f}s")
+        timing_rows.append({
+            "phase": "save_phase", "range_idx": None,
+            "start_date": date_ranges[0][0], "end_date": date_ranges[-1][1], "minutes": _min(dt_save)
+        })
+
+        # --- Daily "how many Rhinos/Calendars I had" reports ---
+        try:
+            legs_ts_path = f"{output_folder_path}/legs_timeseries_{year}.csv"
+            if os.path.exists(legs_ts_path):
+                legs_ts = pd.read_csv(legs_ts_path, parse_dates=['Date'])
+                # distinct open structures active at any time during the day
+                daily_active = (legs_ts
+                    .groupby(['Date','Type'])['StructureID']
+                    .nunique()
+                    .unstack('Type')
+                    .fillna(0)
+                    .astype(int)
+                    .rename(columns={'rhino':'Rhinos', 'calendar':'Calendars'})
+                    .sort_index()
+                )
+                daily_active['Total'] = daily_active.sum(axis=1)
+                daily_active.to_csv(f"{output_folder_path}/daily_active_structures_{year}.csv")
+
+                # active at close (15:15) only
+                eod = legs_ts[legs_ts['Time'] == '15:15']
+                eod_active = (eod.groupby(['Date','Type'])['StructureID']
+                                .nunique()
+                                .unstack('Type')
+                                .fillna(0)
+                                .astype(int)
+                                .rename(columns={'rhino':'Rhinos', 'calendar':'Calendars'})
+                                .sort_index())
+                eod_active['Total'] = eod_active.sum(axis=1)
+                eod_active.to_csv(f"{output_folder_path}/eod_active_structures_{year}.csv")
+
+                log_time(f"🧾 Daily active counts -> {output_folder_path}/daily_active_structures_{year}.csv")
+                log_time(f"🧾 EOD active counts -> {output_folder_path}/eod_active_structures_{year}.csv")
+            else:
+                log_time(f"⚠️ legs_timeseries not found at {legs_ts_path}; skipping daily counts.")
+        except Exception as e:
+            log_time(f"[daily counts] failed: {e}")
+
+        # ======================= PID live PnL & Drawdown tracker =======================
+        # ...
+        # free large per-range data to keep RAM flat across chunks (safe version)
+    for name in [
+        "option_data", "option_data1", "option_data2",
+        "OPTION_DF_MONTHLY", "OPTION_DF_NEXT", "OPTION_DF_FAR",
+        "MIN_IDX_MONTHLY", "MIN_IDX_NEXT", "MIN_IDX_FAR",
+    ]:
+        globals().pop(name, None)
+
+    import gc
+    gc.collect()
+
+    
+    # Save timing rows always (even if no trades)
+    try:
+        timing_df = pd.DataFrame(timing_rows)
+        timing_df.to_csv(f"{output_folder_path}/rhino_timings_{year}_2.csv", index=False)
+        log_time(f"🧾 Timings CSV -> {output_folder_path}/rhino_timings_{year}_2.csv")
+    except Exception as e:
+        log_time(f"[timings save] failed: {e}")
+
+   
+        # --- graceful pool shutdown ---
+    try:
+        if DELTA_POOL is not None:
+            DELTA_POOL.close()
+            DELTA_POOL.join()
+            DELTA_POOL = None
+            log_time("🛑 Multiprocessing pool closed")
+    except Exception as e:
+        log_time(f"[pool close] {e}")
